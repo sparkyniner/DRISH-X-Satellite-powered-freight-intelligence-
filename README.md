@@ -107,9 +107,9 @@ The server starts on port 8000. Open your browser and go to:
 http://localhost:8000
 ```
 
-Open `http://localhost:8000`. Click the **Copernicus Link** tab in the sidebar and enter your Client ID and Client Secret to connect the satellite API. That is it. No config files needed.
+Open `http://localhost:8000`. On first launch a connect window opens automatically — enter your Client ID and Client Secret to link the satellite API (you can also open it anytime via **Connect** on the **Copernicus Link** card in the sidebar). That is it. No config files needed.
 
-If you prefer environment variables instead of the UI, you can copy `.env.example` to `.env` and fill in your keys there. Both methods work. The UI tab is just easier for most people.
+If you prefer environment variables instead of the UI, you can copy `.env.example` to `.env` and fill in your keys there. Both methods work. The connect window is just easier for most people.
 
 ## Using the Interface
 
@@ -153,7 +153,7 @@ export DRISHX_DATA_DIR=/path/to/your/storage
 ### Environment Variables
 
 <img width="1702" height="1073" alt="Image" src="https://github.com/user-attachments/assets/4a131e82-db54-474d-829e-1e4582eed27d" />
-These are optional if you use the Copernicus Link tab in the UI instead.
+These are optional if you connect through the UI instead.
 
 | Variable | Required | Description |
 |---|---|---|

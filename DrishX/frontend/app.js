@@ -22,13 +22,14 @@ class DrishXDashboard {
         console.log("Initializing DrishX Operational Link...");
         this.setupMap();
         this.setupEventListeners();
+        this.setupConnectModal();
         this.setupDocs();
 
         // Initial data fetch
         await this.fetchSites();
 
-        // Boot Auth (BYOK check)
-        this.checkStoredCredentials();
+        // Boot Auth: check real link state, then silently re-link or prompt.
+        this.initAuth();
     }
 
     setupMap() {
@@ -144,9 +145,6 @@ class DrishXDashboard {
         document.getElementById('close-intel')?.addEventListener('click', () => {
             document.getElementById('intel-drawer').classList.add('hidden');
         });
-
-        // Copernicus Auth Link (BYOK)
-        document.getElementById('save-auth')?.addEventListener('click', () => this.handleAuthSave());
     }
 
     async handleLocationSearch() {
@@ -218,7 +216,6 @@ class DrishXDashboard {
         const titles = {
             dashboard: 'Operations',
             trends: 'Tactical Trends',
-            settings: 'Copernicus Link',
             docs: 'Docs'
         };
         const titleEl = document.querySelector('.top-header h1');
@@ -600,13 +597,10 @@ class DrishXDashboard {
     }
 
     notify(msg, type = 'info') {
+        // Console-only for now: the sidebar ticker this used to write to was
+        // replaced by the Copernicus status card. A proper toast system is a
+        // planned follow-up.
         console.log(`[${type.toUpperCase()}] ${msg}`);
-        // Simple UI notification
-        const statusEl = document.querySelector('.status-indicator span:last-child');
-        if (statusEl) {
-            statusEl.textContent = msg;
-            setTimeout(() => { statusEl.textContent = 'System Online'; }, 5000);
-        }
     }
 
     setupDocs() {
@@ -694,45 +688,226 @@ class DrishXDashboard {
         });
     }
 
-    checkStoredCredentials() {
-        const id = localStorage.getItem('drishx_copernicus_id');
-        const secret = localStorage.getItem('drishx_copernicus_secret');
+    // ── Connect modal (Copernicus onboarding) ──────────────────────────────
 
-        if (id && secret) {
-            console.log("DrishX: Stored tactical credentials found. Establishing link...");
-            const idInput = document.getElementById('copernicus-id');
-            const secretInput = document.getElementById('copernicus-secret');
-            if (idInput) idInput.value = id;
-            if (secretInput) secretInput.value = secret;
-            this.handleAuthSave(true); // silent = true
-        }
+    setupConnectModal() {
+        const modal = document.getElementById('connect-modal');
+        if (!modal) return;
+
+        // Reveal / hide the secret field
+        document.querySelectorAll('.reveal-toggle').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const input = document.getElementById(btn.dataset.reveal);
+                if (!input) return;
+                const show = input.type === 'password';
+                input.type = show ? 'text' : 'password';
+                btn.querySelector('i').className = show ? 'fas fa-eye-slash' : 'fas fa-eye';
+                btn.setAttribute('aria-label', show ? 'Hide secret' : 'Show secret');
+            });
+        });
+
+        // State A ⇄ B toggle ("Don't have credentials?" / "Enter my keys")
+        document.querySelectorAll('[data-goto-state]').forEach(btn => {
+            btn.addEventListener('click', () => this.setConnectState(btn.dataset.gotoState));
+        });
+
+        // Close: ✕ button, backdrop click, Esc — but never mid-verification
+        document.querySelectorAll('[data-close-connect]').forEach(btn => {
+            btn.addEventListener('click', () => this.closeConnectModal());
+        });
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal && !this.connecting) this.closeConnectModal();
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && !modal.classList.contains('hidden') && !this.connecting) {
+                this.closeConnectModal();
+            }
+        });
+
+        // Submit (button + Enter in either field)
+        document.getElementById('connect-submit')?.addEventListener('click', () => this.handleConnect());
+        ['connect-id', 'connect-secret'].forEach(id => {
+            document.getElementById(id)?.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') this.handleConnect();
+            });
+        });
     }
 
-    async handleAuthSave(silent = false) {
-        const idInput = document.getElementById('copernicus-id');
-        const secretInput = document.getElementById('copernicus-secret');
-        const statusEl = document.getElementById('auth-status');
-        const connectBtn = document.getElementById('save-auth');
+    setConnectState(state) {
+        document.getElementById('connect-state-a')?.classList.toggle('hidden', state !== 'a');
+        document.getElementById('connect-state-b')?.classList.toggle('hidden', state !== 'b');
+    }
 
-        if (!idInput || !secretInput) return;
+    openConnectModal(state = 'a') {
+        const modal = document.getElementById('connect-modal');
+        if (!modal) return;
+        // Reset any banner left over from a previous session (e.g. a stale
+        // success message after the user has since disconnected).
+        const banner = document.getElementById('connect-status');
+        if (banner) {
+            banner.className = 'connect-banner hidden';
+            banner.innerHTML = '';
+        }
+        this.setConnectState(state);
+        modal.classList.remove('hidden');
+    }
 
-        const id = idInput.value.trim();
-        const secret = secretInput.value.trim();
+    closeConnectModal() {
+        const modal = document.getElementById('connect-modal');
+        if (!modal) return;
+        modal.classList.add('hidden');
+        // Don't re-prompt automatically for the rest of this session.
+        sessionStorage.setItem('drishx_connect_dismissed', '1');
+    }
 
-        if (!id || !secret) {
-            if (!silent) this.notify("Credentials required for orbital link.", "error");
+    // Boot: ask the backend for the real link state, render the sidebar card, then decide what to show.
+    async initAuth() {
+        const status = await this.refreshAuthCard();
+        if (status.linked) return; // already linked (UI or env)
+
+        // Not linked: try a silent re-link from credentials saved in this browser.
+        const id = localStorage.getItem('drishx_copernicus_id');
+        const secret = localStorage.getItem('drishx_copernicus_secret');
+        if (id && secret) {
+            if (await this.silentRelink(id, secret)) { await this.refreshAuthCard(); return; }
+            // Stored keys exist but no longer verify → show the error state, prompt reconnect.
+            this.renderAuthCard('error');
             return;
         }
 
-        if (!silent) {
-            statusEl.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Establishing Orbital Link...';
-            statusEl.className = 'portal-status-msg text-muted';
-            if (connectBtn) {
-                connectBtn.disabled = true;
-                const btnText = connectBtn.querySelector('.btn-text');
-                if (btnText) btnText.textContent = 'Linking...';
-            }
+        // No stored keys → prompt with the connect modal (once per session).
+        if (!sessionStorage.getItem('drishx_connect_dismissed')) {
+            this.openConnectModal('a');
         }
+    }
+
+    // ── Sidebar Copernicus status card ──────────────────────────────────────
+
+    async refreshAuthCard() {
+        let status = { linked: false, source: null, last_verified: null };
+        try {
+            status = await (await fetch('/api/auth/status')).json();
+        } catch (e) {
+            console.warn('Auth status check failed (backend unreachable?):', e);
+        }
+        this.authStatus = status;
+        this.renderAuthCard(status.linked ? 'connected' : 'off', status);
+        return status;
+    }
+
+    renderAuthCard(mode, status = {}) {
+        const card = document.getElementById('copernicus-card');
+        if (!card) return;
+        card.innerHTML = '';
+
+        const header = document.createElement('div');
+        header.className = 'cop-header';
+        const dot = document.createElement('span');
+        const title = document.createElement('span');
+        title.className = 'cop-title';
+        title.textContent = 'Copernicus Link';
+
+        if (mode === 'connected') {
+            dot.className = 'cop-dot cop-dot--connected';
+            const unlink = document.createElement('button');
+            unlink.className = 'cop-unlink';
+            unlink.title = 'Disconnect';
+            unlink.setAttribute('aria-label', 'Disconnect');
+            unlink.innerHTML = '<i class="fas fa-link-slash"></i>';
+            unlink.addEventListener('click', () => this.handleDisconnect());
+            header.append(dot, title, unlink);
+            const meta = document.createElement('div');
+            meta.className = 'cop-meta';
+            const rel = this.relTime(status.last_verified);
+            meta.innerHTML = '<span class="cop-status--connected">Connected</span>'
+                + (rel ? ` · verified ${rel}` : '');
+            card.append(header, meta);
+        } else if (mode === 'error') {
+            dot.className = 'cop-dot cop-dot--error';
+            header.append(dot, title);
+            const msg = document.createElement('div');
+            msg.className = 'cop-msg';
+            msg.textContent = "Couldn't verify your saved keys. Reconnect to continue.";
+            const btn = document.createElement('button');
+            btn.className = 'cop-btn';
+            btn.textContent = 'Reconnect';
+            btn.addEventListener('click', () => this.openConnectModal('a'));
+            card.append(header, msg, btn);
+        } else { // 'off' — not connected
+            dot.className = 'cop-dot cop-dot--off';
+            header.append(dot, title);
+            const meta = document.createElement('div');
+            meta.className = 'cop-meta cop-status--off';
+            meta.textContent = 'Not connected';
+            const btn = document.createElement('button');
+            btn.className = 'cop-btn';
+            btn.textContent = 'Connect';
+            btn.addEventListener('click', () => this.openConnectModal('a'));
+            card.append(header, meta, btn);
+        }
+    }
+
+    relTime(iso) {
+        if (!iso) return null;
+        const then = new Date(iso).getTime();
+        if (isNaN(then)) return null;
+        const s = Math.max(0, Math.floor((Date.now() - then) / 1000));
+        if (s < 60) return 'just now';
+        const m = Math.floor(s / 60); if (m < 60) return `${m}m ago`;
+        const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
+        return `${Math.floor(h / 24)}d ago`;
+    }
+
+    async handleDisconnect() {
+        if (!confirm('Disconnect from Copernicus? Live satellite features stop until you reconnect.')) return;
+        try {
+            await fetch('/api/auth', { method: 'DELETE' });
+        } catch (e) {
+            this.notify('Disconnect failed — is the server running?', 'error');
+            return;
+        }
+        localStorage.removeItem('drishx_copernicus_id');
+        localStorage.removeItem('drishx_copernicus_secret');
+        this.notify('Copernicus disconnected.', 'info');
+        this.renderAuthCard('off');
+    }
+
+    async silentRelink(id, secret) {
+        try {
+            const res = await fetch('/api/auth', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ client_id: id, client_secret: secret })
+            });
+            const data = await res.json();
+            return data.status === 'success';
+        } catch {
+            return false;
+        }
+    }
+
+    async handleConnect() {
+        if (this.connecting) return;
+        const idInput = document.getElementById('connect-id');
+        const secretInput = document.getElementById('connect-secret');
+        const submitBtn = document.getElementById('connect-submit');
+        const id = idInput.value.trim();
+        const secret = secretInput.value.trim();
+
+        // Basic validation + input intelligence (catch mistakes before the round-trip)
+        if (!id || !secret) {
+            this.showConnectBanner('error', 'Enter both your Client ID and Client Secret.');
+            return;
+        }
+        if (id.includes('@')) {
+            this.showConnectBanner('error', 'That looks like your account email — you need the OAuth Client ID from the dashboard.');
+            return;
+        }
+
+        this.connecting = true;
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'CONNECTING…';
+        this.showConnectBanner('connecting', 'Verifying with Copernicus…');
 
         try {
             const res = await fetch('/api/auth', {
@@ -743,31 +918,52 @@ class DrishXDashboard {
             const data = await res.json();
 
             if (data.status === 'success') {
+                this.showConnectBanner('success', 'Linked. Satellite access is live.');
                 localStorage.setItem('drishx_copernicus_id', id);
                 localStorage.setItem('drishx_copernicus_secret', secret);
-
-                if (!silent) {
-                    statusEl.innerHTML = '<i class="fas fa-check-circle text-success"></i> Tactical Link Established.';
-                    this.notify("DrishX: Copernicus link active.", "success");
-                }
+                this.notify('Copernicus link active.', 'success');
+                this.refreshAuthCard(); // reflect the new linked state in the sidebar
+                setTimeout(() => this.closeConnectModal(), 1200);
             } else {
-                if (!silent) {
-                    statusEl.innerHTML = `<i class="fas fa-exclamation-triangle text-error"></i> ${data.message}`;
-                    this.notify("Orbital Handshake Failed.", "error");
-                }
+                this.showConnectBanner('error', this.connectErrorCopy(data));
             }
         } catch (err) {
-            if (!silent) {
-                statusEl.innerHTML = '<i class="fas fa-times-circle text-error"></i> Terminal error during link.';
-                console.error(err);
-            }
+            // Request never reached / parsed the API — the server-unreachable case.
+            console.error('Connect failed:', err);
+            this.showConnectBanner('error', "Can't reach the DrishX server — is it still running?");
         } finally {
-            if (connectBtn) {
-                connectBtn.disabled = false;
-                const btnText = connectBtn.querySelector('.btn-text');
-                if (btnText) btnText.textContent = 'Establish Orbital Link';
-            }
+            this.connecting = false;
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'CONNECT';
         }
+    }
+
+    // Frontend owns the display copy; branch on the backend's machine-readable code.
+    connectErrorCopy(data) {
+        switch (data.code) {
+            case 'invalid_credentials':
+                return 'Copernicus rejected these keys. Re-copy them, or create a new OAuth client.';
+            case 'cdse_unreachable':
+                return "Copernicus isn't responding — your keys may be fine. Try again in a few minutes.";
+            case 'cdse_error':
+                return data.message || 'Copernicus returned an unexpected error.';
+            default:
+                return data.message || 'Could not establish the link.';
+        }
+    }
+
+    showConnectBanner(type, message) {
+        const el = document.getElementById('connect-status');
+        if (!el) return;
+        const icons = { connecting: 'fa-spinner fa-spin', success: 'fa-circle-check', error: 'fa-circle-xmark' };
+        el.className = 'connect-banner connect-banner--' + type;
+        el.innerHTML = '';
+        const i = document.createElement('i');
+        i.className = 'fas ' + (icons[type] || 'fa-circle-info');
+        const span = document.createElement('span');
+        span.textContent = message; // textContent → no injection from server messages
+        el.append(i, span);
+        el.classList.remove('hidden');
     }
 }
 

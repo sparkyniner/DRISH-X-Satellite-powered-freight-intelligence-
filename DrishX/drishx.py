@@ -3,6 +3,7 @@
 import os
 import time
 import json
+import asyncio
 import logging
 import pickle
 import requests
@@ -75,10 +76,25 @@ ox.settings.cache_folder = os.path.join(DATA_DIR, "osm_cache")
 
 # Copernicus Data Space config
 CONFIG = SHConfig()
-CONFIG.sh_client_id = os.getenv("COPERNICUS_CLIENT_ID")
-CONFIG.sh_client_secret = os.getenv("COPERNICUS_CLIENT_SECRET")
+# SHConfig() restores credentials previously saved via the UI (CONFIG.save()).
+# Environment variables take precedence, but only when both are actually set —
+# blindly assigning os.getenv() results would overwrite restored credentials
+# with None on every restart.
+_env_id = os.getenv("COPERNICUS_CLIENT_ID")
+_env_secret = os.getenv("COPERNICUS_CLIENT_SECRET")
+if _env_id and _env_secret:
+    CONFIG.sh_client_id = _env_id
+    CONFIG.sh_client_secret = _env_secret
 CONFIG.sh_base_url = "https://sh.dataspace.copernicus.eu"
 CONFIG.sh_token_url = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+
+# How the active credentials were provided and when they last passed
+# verification. Surfaced by GET /api/auth/status.
+AUTH_STATE = {
+    "source": "env" if (_env_id and _env_secret)
+    else ("ui" if (CONFIG.sh_client_id and CONFIG.sh_client_secret) else None),
+    "last_verified": None,
+}
 
 # SentinelHub Cache Redirection
 CONFIG.cache_dir = os.path.join(DATA_DIR, "sh_cache")
@@ -1086,30 +1102,91 @@ class AuthRequest(BaseModel):
     client_secret: str
 
 
+AUTH_VERIFY_TIMEOUT_S = 15
+
+
+def _verify_credentials():
+    """Request a fresh CDSE token with the credentials currently in CONFIG."""
+    from sentinelhub import SentinelHubSession
+    session = SentinelHubSession(config=CONFIG)
+    _ = session.token
+
+
+def _classify_auth_error(exc: Exception):
+    """Map a verification failure to a machine-readable code + user-facing message."""
+    text = str(exc).lower()
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)) \
+            or "connection" in text or "timed out" in text or "name resolution" in text:
+        return ("cdse_unreachable",
+                "Copernicus is not responding — your keys may be fine. Try again in a few minutes.")
+    if "invalid_client" in text or "invalid client" in text or "unauthorized" in text or "401" in text:
+        return ("invalid_credentials",
+                "Copernicus rejected these keys. Re-copy them, or create a new OAuth client.")
+    return ("cdse_error", f"Copernicus returned an unexpected error: {exc}")
+
+
 @app.post("/api/auth")
 async def authenticate(req: AuthRequest):
     """Validate and store Copernicus credentials at runtime."""
+    prev_id, prev_secret = CONFIG.sh_client_id, CONFIG.sh_client_secret
+    CONFIG.sh_client_id = req.client_id.strip()
+    CONFIG.sh_client_secret = req.client_secret.strip()
+
     try:
-        # Update the running config
-        CONFIG.sh_client_id = req.client_id
-        CONFIG.sh_client_secret = req.client_secret
-        CONFIG.save()
-
-        # Test the credentials by requesting a token
-        from sentinelhub import SentinelHubSession
-        session = SentinelHubSession(config=CONFIG)
-        _ = session.token
-
-        logger.info("Copernicus credentials updated and verified via UI.")
-        return {"status": "success", "message": "Copernicus link established."}
-
+        await asyncio.wait_for(asyncio.to_thread(_verify_credentials), timeout=AUTH_VERIFY_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        CONFIG.sh_client_id, CONFIG.sh_client_secret = prev_id, prev_secret
+        logger.error(f"Auth verification timed out after {AUTH_VERIFY_TIMEOUT_S}s")
+        return {"status": "error", "code": "cdse_unreachable",
+                "message": f"Copernicus did not answer within {AUTH_VERIFY_TIMEOUT_S} seconds — "
+                           "your keys may be fine. Try again in a few minutes."}
     except Exception as e:
-        logger.error(f"Auth failed: {e}")
-        # Revert to env vars if UI credentials fail
-        CONFIG.sh_client_id = os.getenv("COPERNICUS_CLIENT_ID", "")
-        CONFIG.sh_client_secret = os.getenv("COPERNICUS_CLIENT_SECRET", "")
+        # Restore whatever was in place before this attempt. Never fall back to
+        # env vars here: they may be unset, which would wipe working credentials.
+        CONFIG.sh_client_id, CONFIG.sh_client_secret = prev_id, prev_secret
+        code, message = _classify_auth_error(e)
+        logger.error(f"Auth failed ({code}): {e}")
+        return {"status": "error", "code": code, "message": message}
+
+    try:
         CONFIG.save()
-        return {"status": "error", "message": str(e)}
+    except Exception as e:
+        # A persistence failure shouldn't break the live link; it only means
+        # credentials won't survive a server restart.
+        logger.warning(f"Credentials verified but could not be persisted: {e}")
+
+    AUTH_STATE["source"] = "ui"
+    AUTH_STATE["last_verified"] = datetime.utcnow().isoformat() + "Z"
+    logger.info("Copernicus credentials updated and verified via UI.")
+    return {"status": "success", "code": "linked", "message": "Copernicus link established."}
+
+
+@app.get("/api/auth/status")
+async def auth_status():
+    """Report whether credentials are configured, their source, and last verification time."""
+    linked = bool(CONFIG.sh_client_id and CONFIG.sh_client_secret)
+    return {
+        "linked": linked,
+        "source": AUTH_STATE["source"] if linked else None,
+        "last_verified": AUTH_STATE["last_verified"] if linked else None,
+    }
+
+
+@app.delete("/api/auth")
+async def disconnect():
+    """Forget stored Copernicus credentials (runtime and persisted config)."""
+    CONFIG.sh_client_id = ""
+    CONFIG.sh_client_secret = ""
+    try:
+        CONFIG.save()
+    except Exception as e:
+        logger.warning(f"Could not clear persisted credentials: {e}")
+    AUTH_STATE["source"] = None
+    AUTH_STATE["last_verified"] = None
+    message = "Copernicus credentials removed."
+    if os.getenv("COPERNICUS_CLIENT_ID") and os.getenv("COPERNICUS_CLIENT_SECRET"):
+        message += " Environment credentials will re-link on the next server restart."
+    return {"status": "success", "code": "disconnected", "message": message}
 
 
 # Serve static detections
@@ -1121,9 +1198,8 @@ app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
 
 if __name__ == "__main__":
     try:
-        from sentinelhub import SentinelHubSession
-        sh_session = SentinelHubSession(config=CONFIG)
-        _ = sh_session.token
+        _verify_credentials()
+        AUTH_STATE["last_verified"] = datetime.utcnow().isoformat() + "Z"
         logger.info("Copernicus Data Space Authentication: SUCCESS")
     except Exception as e:
         logger.error(f"Copernicus Data Space Authentication: FAILED - {e}")

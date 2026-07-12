@@ -125,29 +125,10 @@ nav {
     border-left: 2px solid var(--accent-blue);
 }
 
-/* Status Indicator */
+/* Sidebar footer (hosts the Copernicus status card) */
 .sidebar-footer {
     padding: 1.5rem;
     border-top: 1px solid var(--border-subtle);
-}
-
-.status-indicator {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    font-size: 0.75rem;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 1px;
-}
-
-.pulse {
-    width: 8px;
-    height: 8px;
-    background: var(--accent-emerald);
-    border-radius: 50%;
-    box-shadow: 0 0 10px var(--accent-emerald);
-    animation: pulse 2s infinite;
 }
 
 @keyframes pulse {
@@ -688,48 +669,12 @@ h1 {
     line-height: 1.6;
 }
 
-/* --- Copernicus Command Portal --- */
-.command-portal-container {
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    min-height: calc(100vh - 120px);
-    padding: 2rem;
-    background: radial-gradient(circle at center, rgba(var(--accent-blue-rgb), 0.05) 0%, transparent 70%);
-}
-
-.command-portal {
-    width: 100%;
-    max-width: 500px;
-    background: rgba(10, 10, 15, 0.8);
-    backdrop-filter: blur(20px);
-    border: 1px solid rgba(var(--accent-blue-rgb), 0.2);
-    border-radius: 12px;
-    padding: 3rem;
-    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5), inset 0 1px 1px rgba(255, 255, 255, 0.05);
-    text-align: center;
-}
-
-.portal-header {
-    margin-bottom: 2.5rem;
-}
-
+/* --- Copernicus connect form primitives (used by the connect modal) --- */
 .portal-icon {
     font-size: 3rem;
     color: var(--accent-blue);
     margin-bottom: 1.5rem;
     filter: drop-shadow(0 0 10px var(--accent-blue));
-}
-
-.portal-header h2 {
-    font-size: 1.8rem;
-    margin-bottom: 0.5rem;
-    letter-spacing: 1px;
-}
-
-.portal-header p {
-    color: var(--text-muted);
-    font-size: 0.9rem;
 }
 
 .input-group-cyber {
@@ -798,32 +743,6 @@ h1 {
 .btn-orbital-connect:hover {
     transform: translateY(-2px);
     box-shadow: 0 0 30px rgba(var(--accent-blue-rgb), 0.4);
-}
-
-.portal-status-msg {
-    min-height: 20px;
-    font-size: 0.85rem;
-}
-
-.setup-hint {
-    border-top: 1px solid rgba(255, 255, 255, 0.05);
-    padding-top: 2rem;
-}
-
-.setup-hint p {
-    font-size: 0.85rem;
-    color: var(--text-muted);
-}
-
-.hint-link {
-    color: var(--accent-blue);
-    text-decoration: none;
-    font-weight: 600;
-    margin-left: 0.5rem;
-}
-
-.hint-link:hover {
-    text-decoration: underline;
 }
 
 .multispectral-view {
@@ -1222,3 +1141,191 @@ h1 {
 .docs-table th, .docs-table td { text-align: left; padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--border-subtle); }
 .docs-table th { color: var(--text-primary); font-weight: 600; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.5px; }
 .docs-table td { color: var(--text-muted); }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Connect Modal (Copernicus onboarding)
+ * ───────────────────────────────────────────────────────────────────────── */
+
+/* Overlay tuned for a compact centered card */
+.connect-overlay { align-items: center; justify-content: center; }
+
+.connect-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    width: 468px;
+    max-width: calc(100vw - 2rem);
+    max-height: calc(100vh - 3rem);
+    overflow-y: auto;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 16px;
+    padding: 32px;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+}
+
+/* Branded header — glaring satellite icon + title, shared across both states */
+.connect-brand { text-align: center; }
+.connect-brand .portal-icon { font-size: 2.25rem; margin-bottom: 0.75rem; }
+.connect-brand h2 { font-size: 1.4rem; font-weight: 600; letter-spacing: 0.5px; }
+
+.connect-state { display: flex; flex-direction: column; gap: 20px; }
+.connect-subtitle {
+    text-align: center; color: var(--text-muted);
+    font-size: 0.85rem; line-height: 1.45; margin-top: -6px;
+}
+
+.connect-close {
+    position: absolute; top: 6px; right: 6px; z-index: 1;
+    background: transparent; border: none; color: var(--text-muted);
+    cursor: pointer; font-size: 1.1rem; padding: 0.35rem; line-height: 1;
+    transition: var(--transition-smooth);
+}
+.connect-close:hover { color: var(--text-primary); }
+
+/* Reveal (show/hide) toggle inside the secret input */
+.input-wrapper .reveal-toggle {
+    position: absolute; right: 0.5rem; top: 50%;
+    transform: translateY(-50%);
+    display: flex; align-items: center; justify-content: center;
+    width: 1.9rem; height: 1.9rem; padding: 0;
+    background: transparent; border: none; color: var(--text-muted);
+    cursor: pointer; font-size: 0.9rem;
+    transition: var(--transition-smooth);
+}
+.input-wrapper .reveal-toggle:hover { color: var(--accent-blue); }
+.input-wrapper input[type="password"],
+#connect-secret { padding-right: 2.6rem; }
+
+/* Ghost secondary button */
+.btn-ghost {
+    width: 100%;
+    background: transparent;
+    color: var(--text-primary);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    padding: 0.85rem;
+    font-family: 'Outfit', sans-serif;
+    font-weight: 600;
+    font-size: 0.85rem;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: var(--transition-smooth);
+}
+.btn-ghost:hover { background: rgba(255, 255, 255, 0.05); border-color: rgba(255, 255, 255, 0.3); }
+.btn-orbital-connect.btn-link {
+    display: flex; align-items: center; justify-content: center; gap: 0.5rem;
+    text-decoration: none; text-align: center;
+}
+/* Modal buttons share one box so primary + secondary are the same height (24px vertical padding) */
+.connect-card .btn-orbital-connect,
+.connect-card .btn-ghost {
+    padding: 12px 20px;
+    font-size: 0.9rem;
+    letter-spacing: 0.5px;
+    margin-top: 0;
+    line-height: 1.2;
+}
+/* Primary has no border of its own — add a transparent one so its box height
+   matches the ghost's (which carries a visible 1px border). */
+.connect-card .btn-orbital-connect { border: 1px solid transparent; }
+.btn-orbital-connect:disabled { opacity: 0.6; cursor: not-allowed; transform: none; box-shadow: none; }
+
+.connect-note { font-size: 0.72rem; color: var(--text-muted); text-align: center; }
+
+/* Status banner (verifying / error / success) */
+.connect-banner {
+    display: flex; align-items: flex-start; gap: 0.6rem;
+    padding: 0.7rem 0.9rem; border-radius: 8px;
+    font-size: 0.82rem; line-height: 1.4;
+    border: 1px solid transparent;
+}
+.connect-banner i { margin-top: 0.1rem; flex-shrink: 0; }
+.connect-banner--connecting {
+    background: rgba(0, 242, 255, 0.06); border-color: rgba(0, 242, 255, 0.25); color: var(--accent-blue);
+}
+.connect-banner--success {
+    background: rgba(0, 255, 157, 0.06); border-color: rgba(0, 255, 157, 0.25); color: var(--accent-emerald);
+}
+/* Softened error — calm notice, not an alarm */
+.connect-banner--error {
+    background: rgba(204, 120, 120, 0.06); border-color: rgba(204, 120, 120, 0.22); color: #e1c9c9;
+}
+.connect-banner--error i { color: #cc7878; }
+
+/* State B — numbered steps */
+.connect-steps { list-style: none; display: flex; flex-direction: column; gap: 16px; }
+.connect-steps li { display: flex; align-items: flex-start; gap: 12px; }
+.step-badge {
+    display: flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; flex-shrink: 0;
+    border-radius: 50%; border: 1px solid var(--border-accent);
+    background: rgba(0, 242, 255, 0.08);
+    color: var(--accent-blue);
+    font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; font-weight: 500;
+}
+.step-body { font-size: 0.88rem; color: var(--text-primary); line-height: 1.4; }
+.step-link { display: block; margin-top: 0.2rem; color: var(--accent-blue); text-decoration: none; font-size: 0.8rem; }
+.step-link:hover { text-decoration: underline; }
+
+/* State B — show-once warning callout (amber) */
+.connect-callout {
+    display: flex; align-items: flex-start; gap: 0.6rem;
+    padding: 0.75rem 0.9rem; border-radius: 8px;
+    background: rgba(255, 184, 0, 0.08); border: 1px solid rgba(255, 184, 0, 0.3);
+    font-size: 0.82rem; line-height: 1.4; color: var(--text-primary);
+}
+.connect-callout i { color: var(--accent-amber); margin-top: 0.1rem; flex-shrink: 0; }
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Sidebar Copernicus link card (replaces the old "System Online" indicator)
+ * ───────────────────────────────────────────────────────────────────────── */
+.copernicus-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding: 0.75rem;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+}
+.cop-header { display: flex; align-items: center; gap: 0.625rem; }
+.cop-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    flex-shrink: 0; background: var(--text-dim);
+}
+.cop-dot--connected { background: var(--accent-emerald); box-shadow: 0 0 8px var(--accent-emerald); animation: pulse 2s infinite; }
+.cop-dot--off { background: #6b727d; }
+.cop-dot--error { background: #cc7878; box-shadow: 0 0 8px rgba(204, 120, 120, 0.6); }
+.cop-title { flex: 1; font-size: 0.8rem; font-weight: 500; color: var(--text-primary); }
+.cop-meta { font-size: 0.7rem; color: var(--text-muted); line-height: 1.4; }
+.cop-status--connected { color: var(--accent-emerald); }
+.cop-status--off { color: var(--text-muted); }
+.cop-status--error { color: #cc7878; }
+.cop-msg { font-size: 0.7rem; color: var(--text-muted); line-height: 1.4; }
+
+/* Unlink (disconnect) icon button — intentionally quiet */
+.cop-unlink {
+    display: flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; flex-shrink: 0;
+    background: transparent; border: none; padding: 0;
+    color: var(--text-muted); cursor: pointer;
+    transition: var(--transition-smooth);
+}
+.cop-unlink:hover { color: #cc7878; }
+
+/* Connect / Reconnect — the action we DO want, so it stays prominent */
+.cop-btn {
+    width: 100%;
+    background: var(--accent-blue);
+    color: var(--bg-base);
+    border: none; border-radius: 6px;
+    padding: 0.55rem;
+    font-family: 'Outfit', sans-serif;
+    font-weight: 600; font-size: 0.78rem; letter-spacing: 0.3px;
+    cursor: pointer;
+    transition: var(--transition-smooth);
+}
+.cop-btn:hover { box-shadow: 0 0 16px rgba(0, 242, 255, 0.35); }

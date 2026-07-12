@@ -33,18 +33,13 @@
                 <button class="nav-item" data-view="trends">
                     <i class="fas fa-chart-line"></i> Tactical Trends
                 </button>
-                <button class="nav-item" data-view="settings">
-                    <i class="fas fa-link"></i> Copernicus Link
-                </button>
                 <button class="nav-item" data-view="docs">
                     <i class="fas fa-book"></i> Docs
                 </button>
             </nav>
             <div class="sidebar-footer">
-                <div class="status-indicator">
-                    <span class="pulse"></span>
-                    <span>System Online</span>
-                </div>
+                <!-- Copernicus link status card — populated by app.js from /api/auth/status -->
+                <div id="copernicus-card" class="copernicus-card"></div>
             </div>
         </aside>
 
@@ -229,53 +224,70 @@
                     </div>
                 </div>
             </div>
-            <!-- Settings View (Copernicus Link) -->
-            <section id="settings-view" class="view hidden">
-                <div class="command-portal-container">
-                    <div class="command-portal">
-                        <div class="portal-header">
-                            <i class="fas fa-satellite-dish portal-icon"></i>
-                            <h2>Copernicus Orbital Access</h2>
-                            <p>Link your CDS credentials to enable mission-grade telemetry.</p>
-                        </div>
+            <!-- Copernicus Connect Modal -->
+            <div id="connect-modal" class="overlay connect-overlay hidden">
+                <div class="connect-card">
+                    <button class="connect-close" data-close-connect aria-label="Close"><i class="fas fa-times"></i></button>
+                    <div class="connect-brand">
+                        <i class="fas fa-satellite-dish portal-icon"></i>
+                        <h2>Copernicus Orbital Access</h2>
+                    </div>
 
-                        <div class="portal-body">
-                            <div class="auth-box">
-                                <div class="input-group-cyber mb-4">
-                                    <label>COPERNICUS CLIENT ID</label>
-                                    <div class="input-wrapper">
-                                        <i class="fas fa-user-shield"></i>
-                                        <input type="password" id="copernicus-id" placeholder="00000000-0000-0000-0000-000000000000">
-                                    </div>
-                                </div>
+                    <!-- STATE A: Connect (has credentials) -->
+                    <div id="connect-state-a" class="connect-state">
+                        <p class="connect-subtitle">Free ESA satellite data powers every analysis</p>
 
-                                <div class="input-group-cyber mb-4">
-                                    <label>COPERNICUS CLIENT SECRET</label>
-                                    <div class="input-wrapper">
-                                        <i class="fas fa-key"></i>
-                                        <input type="password" id="copernicus-secret" placeholder="••••••••••••••••••••••••••••">
-                                    </div>
-                                </div>
-
-                                <button id="save-auth" class="btn-orbital-connect">
-                                    <span class="btn-text">Establish Orbital Link</span>
-                                    <div class="orbital-ring"></div>
-                                </button>
-
-                                <div id="auth-status" class="portal-status-msg mt-3"></div>
-                            </div>
-                            
-                            <div class="setup-hint mt-4">
-                                <p>Don't have your orbital keys yet? 
-                                   <a href="https://shapps.dataspace.copernicus.eu/dashboard/#/" target="_blank" class="hint-link">
-                                       Visit Copernicus Dashboard <i class="fas fa-external-link-alt"></i>
-                                   </a>
-                                </p>
+                        <div class="input-group-cyber">
+                            <label>COPERNICUS CLIENT ID</label>
+                            <div class="input-wrapper">
+                                <i class="fas fa-user-shield"></i>
+                                <input type="text" id="connect-id" placeholder="sh-00000000-0000-0000-0000-000000000000" autocomplete="off" spellcheck="false">
                             </div>
                         </div>
+
+                        <div class="input-group-cyber">
+                            <label>COPERNICUS CLIENT SECRET</label>
+                            <div class="input-wrapper">
+                                <i class="fas fa-key"></i>
+                                <input type="password" id="connect-secret" placeholder="••••••••••••••••••••••••••••" autocomplete="off" spellcheck="false">
+                                <button type="button" class="reveal-toggle" data-reveal="connect-secret" aria-label="Show secret"><i class="fas fa-eye"></i></button>
+                            </div>
+                        </div>
+
+                        <div id="connect-status" class="connect-banner hidden"></div>
+
+                        <button id="connect-submit" class="btn-orbital-connect">CONNECT</button>
+                        <button class="btn-ghost" data-goto-state="b">DON'T HAVE CREDENTIALS?</button>
+
+                        <p class="connect-note">Keys are stored in this browser only and sent nowhere except Copernicus</p>
+                    </div>
+
+                    <!-- STATE B: Get credentials (Journey B) -->
+                    <div id="connect-state-b" class="connect-state hidden">
+                        <p class="connect-subtitle">One-time setup on the Copernicus Data Space</p>
+
+                        <ol class="connect-steps">
+                            <li>
+                                <span class="step-badge">1</span>
+                                <div class="step-body">Sign in to Copernicus, or create a free account
+                                    <a href="https://identity.dataspace.copernicus.eu/auth/realms/CDSE/account/#/personal-info" target="_blank" rel="noopener" class="step-link">identity.dataspace.copernicus.eu <i class="fas fa-arrow-up-right-from-square"></i></a>
+                                </div>
+                            </li>
+                            <li><span class="step-badge">2</span><div class="step-body">Open User Settings → OAuth clients</div></li>
+                            <li><span class="step-badge">3</span><div class="step-body">Create a new OAuth client (any name works)</div></li>
+                            <li><span class="step-badge">4</span><div class="step-body">Copy the Client ID and Secret it shows you</div></li>
+                        </ol>
+
+                        <div class="connect-callout">
+                            <i class="fas fa-triangle-exclamation"></i>
+                            <span>The Client Secret is shown only once — copy it before you leave.</span>
+                        </div>
+
+                        <a href="https://shapps.dataspace.copernicus.eu/dashboard/#/account/settings" target="_blank" rel="noopener" class="btn-orbital-connect btn-link">OPEN COPERNICUS DASHBOARD <i class="fas fa-arrow-up-right-from-square"></i></a>
+                        <button class="btn-ghost" data-goto-state="a">ENTER MY KEYS</button>
                     </div>
                 </div>
-            </section>
+            </div>
 
             <!-- Docs View -->
             <section id="docs-view" class="view hidden">
@@ -393,7 +405,7 @@ python drishx.py</code></pre>
                                     <div class="docs-step-num">5</div>
                                     <div class="docs-step-body">
                                         <h4 class="docs-step-title">Connect DrishX</h4>
-                                        <p>Back in DrishX, open the <strong>Copernicus Link</strong> tab, paste your <strong>Client ID</strong> and <strong>Client Secret</strong> into the connect modal, and click <strong>Establish Orbital Link</strong>. Once it confirms, live telemetry is online — no config files needed.</p>
+                                        <p>Back in DrishX, the connect window opens automatically on first launch — or click <strong>Connect</strong> on the <strong>Copernicus Link</strong> card in the sidebar. Paste your <strong>Client ID</strong> and <strong>Client Secret</strong> and click <strong>Connect</strong>. Once it confirms, live telemetry is online — no config files needed.</p>
                                     </div>
                                 </div>
                             </div>
