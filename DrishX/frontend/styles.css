@@ -358,6 +358,10 @@ h1 {
     padding: 1.25rem;
 }
 
+.mission-presets > .control-group + .control-group {
+    margin-top: 0.75rem;
+}
+
 .hud-label {
     font-size: 0.65rem;
     text-transform: uppercase;
@@ -368,21 +372,34 @@ h1 {
 }
 
 .hud-select {
+    color-scheme: dark;
     width: 100%;
-    background: rgba(255, 255, 255, 0.03);
+    min-height: 42px;
+    background-color: #111a24;
     border: 1px solid var(--border-subtle);
     color: var(--text-primary);
-    padding: 0.6rem;
+    padding: 0.65rem 0.75rem;
     border-radius: 8px;
+    font-family: inherit;
     font-size: 0.85rem;
-    margin-bottom: 0.5rem;
-    outline: none;
-    transition: var(--transition-smooth);
+    line-height: 1.4;
+    cursor: pointer;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.hud-select option {
+    background-color: #111a24;
+    color: #f0f6fc;
+}
+
+.hud-select:hover {
+    border-color: var(--text-muted);
 }
 
 .hud-select:focus {
     border-color: var(--accent-blue);
-    background: rgba(0, 242, 255, 0.05);
+    outline: 2px solid rgba(0, 242, 255, 0.35);
+    outline-offset: 2px;
 }
 
 .hud-buttons {
@@ -458,6 +475,7 @@ h1 {
 .strategic-dashboard {
     padding: 2rem;
     height: 100%;
+    overflow-y: auto;
     background: #020406;
 }
 
@@ -1329,3 +1347,12 @@ h1 {
     transition: var(--transition-smooth);
 }
 .cop-btn:hover { box-shadow: 0 0 16px rgba(0, 242, 255, 0.35); }
+/* Observation quality: keep gaps and experimental filters explicit. */
+.quality-note { color: #94a3b8; font-size: 12px; line-height: 1.5; margin: 10px 16px; }
+.control-group .quality-note { margin: 6px 0; }
+.quality-table-wrap { padding: 0 20px 20px; overflow-x: auto; }
+.quality-table-wrap h4 { margin: 20px 0 10px; }
+.quality-export { display: inline-block; margin: 0 20px 12px 0; color: #60a5fa; font-size: 13px; }
+.quality-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.quality-table th, .quality-table td { text-align: left; padding: 9px; border-bottom: 1px solid #334155; }
+.quality-table th { color: #94a3b8; }
