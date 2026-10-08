@@ -16,7 +16,7 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
     <link rel="stylesheet" type="text/css" href="https://npmcdn.com/flatpickr/dist/themes/dark.css">
     <!-- Styles -->
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles.css?v=20261008-dropdowns">
 </head>
 <body class="dark-theme">
     <div id="app">
@@ -81,7 +81,7 @@
                             </div>
                             <div class="mission-presets">
                                 <div class="control-group mb-2">
-                                    <label class="hud-label">Temporal Depth</label>
+                                    <label class="hud-label" for="mission-months">Temporal Depth</label>
                                     <select id="mission-months" class="hud-select">
                                         <option value="1">1 Month</option>
                                         <option value="3">3 Months</option>
@@ -94,14 +94,22 @@
                                     </select>
                                 </div>
                                 <div class="control-group mb-2">
-                                    <label class="hud-label">Observation Depth</label>
+                                    <label class="hud-label" for="mission-frames">Observation Depth</label>
                                     <select id="mission-frames" class="hud-select">
-                                        <option value="5">Fast Scan</option>
-                                        <option value="10" selected>Balanced</option>
+                                        <option value="5" selected>Fast Scan · 5 dates</option>
+                                        <option value="10">Balanced · 10 dates</option>
                                         <option value="25">Deep Scan</option>
                                         <option value="50">Strategic Audit</option>
                                         <option value="1000">MAX Density</option>
                                     </select>
+                                </div>
+                                <div class="control-group mb-2">
+                                    <label class="hud-label" for="mission-profile">Detection filter</label>
+                                    <select id="mission-profile" class="hud-select" aria-describedby="mission-profile-help">
+                                        <option value="balanced" selected>Balanced</option>
+                                        <option value="precision">Strict (experimental)</option>
+                                    </select>
+                                    <p id="mission-profile-help" class="quality-note">Strict requires stronger spectral evidence and may miss more vehicles.</p>
                                 </div>
                                 <div class="hud-buttons">
                                     <button id="draw-aoi" class="btn btn-hud-primary">
@@ -167,8 +175,9 @@
                     <div class="strategic-grid">
                         <div class="card glass-panel chart-card full-span">
                             <div class="card-header">
-                                <h3><i class="fas fa-chart-area text-accent"></i> Temporal Logistics Signature</h3>
+                                <h3><i class="fas fa-chart-area text-accent"></i> Candidate vehicles per usable overpass</h3>
                             </div>
+                            <p class="quality-note">Dates with less than 80% clear road coverage or failed imagery are gaps. Zero means a usable observation with no detections. Compare the same corridor and filter; counts are snapshots, not daily traffic totals.</p>
                             <div class="chart-viewport">
                                 <canvas id="trend-chart"></canvas>
                             </div>
@@ -176,20 +185,24 @@
 
                         <div class="stat-row">
                             <div class="card glass-panel mini-stat">
-                                <span class="stat-label">Total Volume</span>
+                                <span class="stat-label">Candidate signatures</span>
                                 <span id="stat-total" class="stat-value">0</span>
                                 <span class="stat-unit">S2 Detections</span>
                             </div>
                             <div class="card glass-panel mini-stat accent-blue">
-                                <span class="stat-label">Active Profiles</span>
+                                <span class="stat-label">Usable observations</span>
                                 <span id="stat-avg" class="stat-value">0</span>
-                                <span class="stat-unit">Correlated</span>
+                                <span class="stat-unit">At least 80% clear roads</span>
                             </div>
                             <div class="card glass-panel mini-stat">
-                                <span class="stat-label">Operational Coverage</span>
+                                <span class="stat-label">Excluded observations</span>
                                 <span id="stat-peak" class="stat-value">--</span>
-                                <span class="stat-unit">Territory</span>
+                                <span class="stat-unit">Low coverage or failed</span>
                             </div>
+                        </div>
+                        <div class="card glass-panel full-span">
+                            <div class="card-header"><h3>Observation quality &amp; exports</h3></div>
+                            <div id="observation-quality" class="quality-table-wrap"></div>
                         </div>
                     </div>
                 </div>
@@ -259,7 +272,7 @@
                         <button id="connect-submit" class="btn-orbital-connect">CONNECT</button>
                         <button class="btn-ghost" data-goto-state="b">DON'T HAVE CREDENTIALS?</button>
 
-                        <p class="connect-note">Keys are stored in this browser only and sent nowhere except Copernicus</p>
+                        <p class="connect-note">Keys are saved in this browser and the local server configuration, and used to authenticate with Copernicus.</p>
                     </div>
 
                     <!-- STATE B: Get credentials (Journey B) -->
@@ -482,7 +495,7 @@ python drishx.py</code></pre>
                                     <div class="docs-step-num">2</div>
                                     <div class="docs-step-body">
                                         <h4 class="docs-step-title">Random Forest classification</h4>
-                                        <p>Each pixel is classified as background, blue, green, or red — with background confidence thresholded at 0.75.</p>
+                                        <p>Road pixels are classified as background, blue, green, or red. Blue seeds require a score of 0.75 in Balanced mode or 0.85 in Strict mode. The trained model is required.</p>
                                     </div>
                                 </div>
                                 <div class="docs-step">
@@ -549,7 +562,7 @@ python drishx.py</code></pre>
                             <h3 class="docs-h3">Resolution</h3>
                             <p>10 m pixels; a ~18 m truck spans ~2 px, and the motion smear extends it to 3–5 px. Cars (~4.5 m) are sub-pixel and invisible. Smaller vehicles need PlanetScope (3.7 m, same physics, Planet Labs key).</p>
                             <h3 class="docs-h3">Cloud cover</h3>
-                            <p>DrishX uses the Sentinel-2 cloud mask to exclude cloudy pixels; overcast frames correctly show zero detections. Read the moving-average trend, not individual days.</p>
+                            <p>DrishX excludes cloud, shadow, snow, defective and no-data pixels, with a one-pixel margin. Observations with less than 80% usable road coverage appear as gaps, never as zero traffic. Export observation CSVs to inspect coverage and failed acquisitions.</p>
                             <h3 class="docs-h3">Regional accuracy</h3>
                             <p>Trained on German autobahns. Accuracy varies by region:</p>
                             <div class="docs-tabs">
