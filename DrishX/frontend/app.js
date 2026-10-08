@@ -39,7 +39,7 @@ class DrishXDashboard {
             center: testArea,
             zoom: 14,
             zoomControl: false,
-            attributionControl: false
+            attributionControl: true
         });
 
         this.updateBasemap();
@@ -84,11 +84,13 @@ class DrishXDashboard {
 
         const url = this.isSatellite
             ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
-            : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+            : 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
 
         this.currentBasemap = L.tileLayer(url, {
-            subdomains: 'abcd',
-            maxZoom: 20
+            maxZoom: this.isSatellite ? 20 : 19,
+            attribution: this.isSatellite
+                ? 'Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community'
+                : '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
         }).addTo(this.map);
     }
 
@@ -104,7 +106,7 @@ class DrishXDashboard {
         document.getElementById('toggle-satellite')?.addEventListener('click', () => {
             this.isSatellite = !this.isSatellite;
             this.updateBasemap();
-            this.notify(`Basemap switched to ${this.isSatellite ? 'Satellite' : 'Dark Mode'}`, "info");
+            this.notify(`Basemap switched to ${this.isSatellite ? 'Satellite' : 'OpenStreetMap'}`, "info");
         });
 
         // Navigation
@@ -234,14 +236,55 @@ class DrishXDashboard {
 
             // Update stats
             document.getElementById('stat-total').textContent = data.summary.total_detections;
-            document.getElementById('stat-peak').textContent = data.summary.missions_count + " Sectors";
-            document.getElementById('stat-avg').textContent = data.datasets.length;
+            document.getElementById('stat-peak').textContent = data.summary.excluded_observations;
+            document.getElementById('stat-avg').textContent = data.summary.usable_observations;
 
             this.renderTrendChart(data);
+            this.renderObservationQuality(data);
             this.updateMissionSelector();
         } catch (e) {
             console.error("Trends fetch error:", e);
             this.notify("Failed to sync historical trends.", "error");
+        }
+    }
+
+    renderObservationQuality(data) {
+        const container = document.getElementById('observation-quality');
+        if (!container) return;
+        container.replaceChildren();
+        if (!data.datasets.length) {
+            container.textContent = 'Run an analysis to inspect observations and export results.';
+            return;
+        }
+        for (const dataset of data.datasets) {
+            const title = document.createElement('h4');
+            title.textContent = dataset.label;
+            container.appendChild(title);
+            for (const kind of ['observations', 'detections']) {
+                const link = document.createElement('a');
+                link.href = `/api/missions/${encodeURIComponent(dataset.mission_id)}/export?kind=${kind}`;
+                link.textContent = `Download ${kind} CSV (all dates)`;
+                link.className = 'quality-export';
+                container.appendChild(link);
+            }
+            const table = document.createElement('table');
+            table.className = 'quality-table';
+            const header = table.createTHead().insertRow();
+            for (const label of ['Date (UTC)', 'Filter', 'Status', 'Clear road coverage', 'Candidates']) {
+                const th = document.createElement('th');
+                th.textContent = label;
+                header.appendChild(th);
+            }
+            const body = table.createTBody();
+            for (const obs of dataset.observations.filter(Boolean)) {
+                const row = body.insertRow();
+                const values = [obs.timestamp.slice(0, 10), obs.profile,
+                    obs.status.replaceAll('_', ' '),
+                    obs.clear_road_fraction == null ? 'Unavailable' : `${(obs.clear_road_fraction * 100).toFixed(0)}%`,
+                    obs.detection_count == null ? 'Not observed' : obs.detection_count];
+                for (const value of values) row.insertCell().textContent = value;
+            }
+            container.appendChild(table);
         }
     }
 
@@ -304,7 +347,8 @@ class DrishXDashboard {
                     ...ds,
                     borderWidth: 3,
                     fill: true,
-                    tension: 0.4,
+                    tension: 0,
+                    spanGaps: false,
                     pointRadius: 4,
                     pointBackgroundColor: ds.borderColor
                 }))
@@ -324,7 +368,13 @@ class DrishXDashboard {
                         titleColor: '#94a3b8',
                         bodyColor: '#fff',
                         borderColor: 'rgba(255,255,255,0.1)',
-                        borderWidth: 1
+                        borderWidth: 1,
+                        callbacks: {
+                            afterLabel: (ctx) => {
+                                const obs = ctx.dataset.observations?.[ctx.dataIndex];
+                                return obs ? `${(obs.clear_road_fraction * 100).toFixed(0)}% clear roads · ${obs.profile}` : '';
+                            }
+                        }
                     }
                 },
                 scales: {
@@ -372,7 +422,7 @@ class DrishXDashboard {
         };
 
         const months = parseInt(document.getElementById('mission-months')?.value || 4);
-        const frames = parseInt(document.getElementById('mission-frames')?.value || 10);
+        const frames = parseInt(document.getElementById('mission-frames')?.value || 5);
         const label = siteName ? `Mission: ${siteName}` : `Analysis Area ${new Date().toLocaleTimeString()} (${months}mo, ${frames}fr)`;
 
         try {
@@ -384,6 +434,7 @@ class DrishXDashboard {
                     label: label,
                     months: months,
                     max_frames: frames,
+                    profile: document.getElementById('mission-profile')?.value || 'balanced',
                     site_id: siteId
                 })
             });
@@ -411,8 +462,9 @@ class DrishXDashboard {
                             stepText.innerText = evt.message;
                             appendLog(evt.message);
                         } else if (evt.type === 'result') {
+                            this.allMissionsFetched = false;
                             appendLog("Mission complete. Synchronizing results...");
-                            this.notify(evt.message, "success");
+                            this.notify(evt.message, evt.usable_observations ? "success" : "info");
 
                             // Successful finish
                             setTimeout(() => {
@@ -426,7 +478,7 @@ class DrishXDashboard {
                                 }
                             }, 1500);
                         } else if (evt.type === 'error') {
-                            this.notify(evt.status === 'error' ? evt.message : "Analysis failed.", "error");
+                            this.notify(evt.message || "Analysis failed.", "error");
                             appendLog(`ERROR: ${evt.message}`);
                             setTimeout(() => hud.classList.add('hidden'), 3000);
                         }
@@ -526,10 +578,10 @@ class DrishXDashboard {
                     </div>
                     <div class="tel-item">
                         <span class="hud-label">Time (UTC)</span>
-                        <span class="tel-value">${new Date(d.timestamp).toLocaleTimeString()}</span>
+                        <span class="tel-value">${new Date(d.timestamp).toLocaleTimeString('en-GB', { timeZone: 'UTC' })}</span>
                     </div>
                     <div class="tel-item accent-blue">
-                        <span class="hud-label">Logistics Speed</span>
+                        <span class="hud-label">Approx. speed</span>
                         <span class="tel-value">${d.speed_kmh} KM/H</span>
                     </div>
                     <div class="tel-item">
@@ -541,10 +593,11 @@ class DrishXDashboard {
                         <span class="tel-value">${d.lat.toFixed(4)}, ${d.lon.toFixed(4)}</span>
                     </div>
                     <div class="tel-item highlight-amber">
-                        <span class="hud-label">Spectral Conf.</span>
-                        <span class="tel-value">${(d.confidence * 100).toFixed(1)}%</span>
+                        <span class="hud-label">Spectral score</span>
+                        <span class="tel-value">${d.s_score.toFixed(2)} / 2</span>
                     </div>
                 </div>
+                <p class="quality-note">Candidate vehicle · ${d.profile || 'balanced'} filter. Spectral score is not a calibrated probability. Review the image before drawing conclusions.</p>
             </div>
         `;
     }
@@ -763,6 +816,11 @@ class DrishXDashboard {
     // Boot: ask the backend for the real link state, render the sidebar card, then decide what to show.
     async initAuth() {
         const status = await this.refreshAuthCard();
+        if (status.verification_error) {
+            this.openConnectModal('a');
+            this.showConnectBanner('error', status.verification_error.message);
+            return;
+        }
         if (status.linked) return; // already linked (UI or env)
 
         // Not linked: try a silent re-link from credentials saved in this browser.
@@ -791,7 +849,7 @@ class DrishXDashboard {
             console.warn('Auth status check failed (backend unreachable?):', e);
         }
         this.authStatus = status;
-        this.renderAuthCard(status.linked ? 'connected' : 'off', status);
+        this.renderAuthCard(status.verification_error ? 'error' : (status.linked ? 'connected' : 'off'), status);
         return status;
     }
 
