@@ -6,22 +6,33 @@ import json
 import asyncio
 import logging
 import pickle
+import csv
+import io
+import uuid
+import hashlib
+from xml.etree import ElementTree
 import requests
 import imageio.v3 as imageio
 import numpy as np
 import geopandas as gpd
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Literal
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from shapely.geometry import LineString
+from shapely.geometry import LineString, box
+from pyproj import Transformer
+from rasterio import features as rio_features, transform as rio_transform
+from detection_quality import (
+    PROFILES, valid_data_mask, road_buffer_m, select_observations,
+    observation_quality, build_trends,
+)
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 import uvicorn
 
 import osmnx as ox
@@ -35,7 +46,10 @@ from dotenv import load_dotenv
 # Setup
 # ─────────────────────────────────────────────────────────────────────────────
 
-load_dotenv()
+# Only project configuration may override saved UI credentials. The default
+# dotenv search walks up to the home directory and can load unrelated old keys.
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ARGUS")
@@ -48,9 +62,7 @@ DETECTION_DIR = os.path.join(DATA_DIR, "sentinel_data/detections")
 os.makedirs(DETECTION_DIR, exist_ok=True)
 
 OVERPASS_MIRRORS = [
-    "https://lz4.overpass-api.de/api/interpreter",
-    "https://z.overpass-api.de/api/interpreter",
-    "https://overpass.osm.ch/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
     "https://overpass-api.de/api/interpreter",
 ]
 
@@ -94,6 +106,7 @@ AUTH_STATE = {
     "source": "env" if (_env_id and _env_secret)
     else ("ui" if (CONFIG.sh_client_id and CONFIG.sh_client_secret) else None),
     "last_verified": None,
+    "verification_error": None,
 }
 
 # SentinelHub Cache Redirection
@@ -153,14 +166,14 @@ def pick_arr_subset(arr, y, x, size):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature stack — exact 7 features as in S2TD._build_feature_stack (Table 1)
+# Feature stack — 7 features used by the supplied S2TD model
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_feature_stack(data):
+def build_feature_stack(data, road_mask=None):
     """
     Build the 7-feature stack from Sentinel-2 bands.
 
-    Input `data` shape: (H, W, 5) with channels [B04(R), B03(G), B02(B), B08(NIR), CLM].
+    Input channels: B04(R), B03(G), B02(B), B08(NIR), CLM[, SCL, dataMask].
 
     Feature order (Table 1, Fisser et al. 2022):
         0: variance of (B04, B03, B02)
@@ -175,7 +188,6 @@ def build_feature_stack(data):
     G = data[:, :, 1].astype(np.float32)    # B03
     B = data[:, :, 2].astype(np.float32)    # B02
     NIR = data[:, :, 3].astype(np.float32)  # B08
-    CLM = data[:, :, 4]
 
     # Rescale if needed
     bands = np.stack([R, G, B, NIR], axis=0)
@@ -183,7 +195,9 @@ def build_feature_stack(data):
     R, G, B, NIR = bands[0], bands[1], bands[2], bands[3]
 
     # Cloud mask → NaN
-    cloud = CLM > 0
+    cloud = ~valid_data_mask(data)
+    if road_mask is not None:
+        cloud |= ~road_mask.astype(bool)
     R[cloud] = np.nan
     G[cloud] = np.nan
     B[cloud] = np.nan
@@ -198,7 +212,8 @@ def build_feature_stack(data):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             # Feature 0: variance of visible bands
-            fs[0] = np.nanvar(np.stack([R, G, B], axis=0), axis=0, ddof=0)
+            # The supplied S2TD model uses division by N+1 (ddof=-1).
+            fs[0] = np.nanvar(np.stack([R, G, B], axis=0), axis=0, ddof=-1)
 
             # Features 1–2: normalized ratios
             fs[1] = normalized_ratio(R, B)
@@ -229,7 +244,7 @@ def build_feature_stack(data):
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Path to the trained Random Forest model from S2TruckDetect
-RF_MODEL_PATH = os.getenv("RF_MODEL_PATH", "rf_model.pickle")
+RF_MODEL_PATH = os.getenv("RF_MODEL_PATH", os.path.join(os.path.dirname(__file__), "rf_model.pickle"))
 _rf_model = None
 
 
@@ -241,24 +256,28 @@ def load_rf_model(path=None):
         return _rf_model
     if os.path.isfile(p):
         try:
-            _rf_model = pickle.load(open(p, "rb"))
+            with open(p, "rb") as model_file:
+                model = pickle.load(model_file)
+            if set(model.classes_) != {1, 2, 3, 4} or model.n_features_in_ != 7:
+                raise ValueError("Expected S2TD classes 1=background, 2=blue, 3=green, 4=red and 7 features")
+            _rf_model = model
             logger.info(f"Loaded trained RF model from {p}")
             return _rf_model
         except Exception as e:
             logger.error(f"Failed to load RF model from {p}: {e}")
     else:
-        logger.warning(f"RF model not found at {p} — will use proxy classifier (lower accuracy)")
+        logger.warning(f"RF model not found at {p} — analysis is unavailable")
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Classification — real RF (preferred) or proxy fallback
+# Classification — trained RF with explicit class labels
 # ─────────────────────────────────────────────────────────────────────────────
 
-def rf_classify(feature_stack, road_mask, rf_model):
+def rf_classify(feature_stack, road_mask, rf_model, profile="balanced"):
     """
     Classify pixels using the trained Random Forest model.
-    Exact replica of S2TD._predict + _postprocess_prediction.
+    Map model classes explicitly and require a strong blue seed.
 
     :param feature_stack: (7, H, W) feature array
     :param road_mask: (H, W) binary road mask
@@ -266,6 +285,8 @@ def rf_classify(feature_stack, road_mask, rf_model):
     :return: (probabilities (4, H, W), prediction (H, W) int8)
     """
     H, W = feature_stack.shape[1], feature_stack.shape[2]
+    if set(rf_model.classes_) != {1, 2, 3, 4}:
+        raise ValueError("Unsupported model classes; expected numeric S2TD labels 1–4")
 
     # Reshape to (n_pixels, 7) for sklearn
     vars_reshaped = []
@@ -279,6 +300,7 @@ def rf_classify(feature_stack, road_mask, rf_model):
         nan_mask_flat[:, var_idx] = ~np.isnan(vars_reshaped[:, var_idx])
     not_nan = (np.nanmin(nan_mask_flat, axis=1).astype(bool)
                & np.min(np.isfinite(vars_reshaped), axis=1).astype(bool))
+    not_nan &= road_mask.astype(bool).ravel()
 
     # Run RF predict_proba on valid pixels only
     if not np.any(not_nan):
@@ -290,10 +312,10 @@ def rf_classify(feature_stack, road_mask, rf_model):
     predictions_flat = rf_model.predict_proba(vars_reshaped[not_nan])
 
     # Map probabilities back to spatial grid
-    n_classes = predictions_flat.shape[1] 
+    n_classes = 4
     probabilities_shaped = np.zeros((n_classes, H * W), dtype=np.float32)
-    for idx in range(n_classes):
-        probabilities_shaped[idx, not_nan] = predictions_flat[:, idx]
+    for idx, label in enumerate(rf_model.classes_):
+        probabilities_shaped[int(label) - 1, not_nan] = predictions_flat[:, idx]
 
     probabilities_shaped = probabilities_shaped.reshape((n_classes, H, W))
 
@@ -301,11 +323,12 @@ def rf_classify(feature_stack, road_mask, rf_model):
     nan_2d = np.isnan(feature_stack[0])
     probabilities_shaped[:, nan_2d] = 0
 
-    # Post-process: suppress low-confidence background (exact S2TD logic)
-    probabilities_shaped[1][probabilities_shaped[1] < 0.75] = 0
+    # Index 1 is BLUE, not background. Retain raw probabilities for scoring.
+    eligible = probabilities_shaped.copy()
+    eligible[1][eligible[1] < PROFILES[profile]["blue_min"]] = 0
 
-    classification = np.nanargmax(probabilities_shaped, axis=0).astype(np.int8) + 1
-    classification[np.max(probabilities_shaped, axis=0) == 0] = 0
+    classification = np.nanargmax(eligible, axis=0).astype(np.int8) + 1
+    classification[np.max(eligible, axis=0) == 0] = 0
     classification[nan_2d] = 0
 
     # Apply road mask
@@ -315,68 +338,20 @@ def rf_classify(feature_stack, road_mask, rf_model):
     return probabilities_shaped, classification
 
 
-def proxy_classify(feature_stack, road_mask):
-    """
-    Heuristic proxy when RF model is unavailable. Lower accuracy.
-
-    Produces:
-        probabilities: (4, H, W) — class probs for [background, blue, green, red]
-        prediction:    (H, W)    — int8 labels {0=nan, 1=background, 2=blue, 3=green, 4=red}
-    """
-    fs = feature_stack  # (7, H, W)
-    H, W = fs.shape[1], fs.shape[2]
-    probs = np.zeros((4, H, W), dtype=np.float32)
-
-    centered_R = fs[3]
-    centered_G = fs[4]
-    centered_B = fs[5]
-    var_feat = fs[0]
-    nratio_rb = fs[1]
-    nratio_gb = fs[2]
-
-    rm = road_mask.astype(bool)
-    nan_mask = np.isnan(centered_R)
-
-    blue_score = np.clip(-nratio_rb * 2 + centered_B * 5 + var_feat * 10, 0, None)
-    blue_score[~rm | nan_mask] = 0
-
-    green_score = np.clip(nratio_gb * 2 + centered_G * 5 + var_feat * 10, 0, None)
-    green_score[~rm | nan_mask] = 0
-
-    red_score = np.clip(nratio_rb * 2 + centered_R * 5 + var_feat * 10, 0, None)
-    red_score[~rm | nan_mask] = 0
-
-    total = blue_score + green_score + red_score + 1e-8
-    probs[1] = blue_score / total
-    probs[2] = green_score / total
-    probs[3] = red_score / total
-    probs[0] = 1.0 - np.max(probs[1:], axis=0)
-
-    probs[0][probs[0] < 0.75] = 0
-
-    classification = np.nanargmax(probs, axis=0).astype(np.int8) + 1
-    classification[np.max(probs, axis=0) == 0] = 0
-    classification[nan_mask] = 0
-    classification[~rm] = 0
-
-    return probs, classification
-
-
-def classify(feature_stack, road_mask, rf_model=None):
+def classify(feature_stack, road_mask, rf_model=None, profile="balanced"):
     """
     Unified classifier entry point.
-    Uses trained RF if model is provided, otherwise falls back to proxy.
+    Require the trained RF. Heuristic outputs must not masquerade as detections.
     """
     if rf_model is not None:
         logger.debug("Using trained RF model for classification")
-        return rf_classify(feature_stack, road_mask, rf_model)
+        return rf_classify(feature_stack, road_mask, rf_model, profile)
     else:
-        logger.debug("Using proxy classifier (no RF model loaded)")
-        return proxy_classify(feature_stack, road_mask)
+        raise ValueError("Trained RF model unavailable. Install rf_model.pickle with Git LFS and scikit-learn 1.3.2.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Object extraction — faithful port of S2TD ObjectExtractor
+# Object extraction — S2TD clustering with support and edge checks
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ObjectExtractor:
@@ -385,7 +360,7 @@ class ObjectExtractor:
     neighbourhood clustering, matching the S2TD reference implementation.
     """
 
-    def __init__(self, probabilities, lat_arr, lon_arr):
+    def __init__(self, probabilities, lat_arr=None, lon_arr=None, *, profile="balanced", transform=None, crs=None):
         """
         :param probabilities: (4, H, W) class probabilities
         :param lat_arr: 1-D array of latitude per row
@@ -394,6 +369,9 @@ class ObjectExtractor:
         self.probabilities = probabilities
         self.lat = lat_arr
         self.lon = lon_arr
+        self.profile = PROFILES[profile]
+        self.transform = transform
+        self.to_wgs84 = Transformer.from_crs(crs, "EPSG:4326", always_xy=True) if crs else None
 
     def extract(self, predictions_arr):
         """Main extraction loop over all blue (class 2) seed pixels."""
@@ -414,13 +392,9 @@ class ObjectExtractor:
             subset_3 = pick_arr_subset(preds, y_blue, x_blue, 3).copy()
             subset_9_probs = pick_arr_subset(probs, y_blue, x_blue, sub_size).copy()
 
-            half_idx_y = y_blue if subset_9.shape[0] < sub_size else subset_9.shape[0] // 2
-            half_idx_x = x_blue if subset_9.shape[1] < sub_size else subset_9.shape[1] // 2
-            try:
-                current_value = subset_9[half_idx_y, half_idx_x]
-            except IndexError:
-                half_idx_y, half_idx_x = sub_size // 2, sub_size // 2
-                current_value = subset_9[half_idx_y, half_idx_x]
+            half_idx_y = y_blue - max(0, y_blue - sub_size // 2)
+            half_idx_x = x_blue - max(0, x_blue - sub_size // 2)
+            current_value = subset_9[half_idx_y, half_idx_x]
 
             new_value = 100
             if not all(v in subset_9 for v in [2, 3, 4]):
@@ -481,8 +455,8 @@ class ObjectExtractor:
         while len(ys) == 0 and window_idx < len(windows):
             window = windows[window_idx]
             window_p = windows_probs[window_idx]
-            offset_y = window.shape[0] // 2
-            offset_x = window.shape[1] // 2
+            offset_y = min(point[0], 1)
+            offset_x = min(point[1], 1)
 
             go_next = (current_value + 1) in window or current_value == 2
             target_value = current_value + 1 if go_next else current_value
@@ -496,7 +470,7 @@ class ObjectExtractor:
             # Probability-based tie-breaking
             if len(ys_found) > 1 and window_p.ndim == 3 and window_p.shape[0] > (target_value - 1):
                 wp_target = window_p[target_value - 1] * match
-                max_prob_mask = (wp_target == np.max(wp_target))
+                max_prob_mask = match & (wp_target == np.max(wp_target[match]))
                 ys_found, xs_found = np.where(max_prob_mask)
 
             ys, xs = ys_found, xs_found
@@ -542,11 +516,11 @@ class ObjectExtractor:
     def _postprocess_cluster(self, cluster, preds_copy, probs, subset_3,
                              y_blue, x_blue, half_idx_y, half_idx_x,
                              new_value):
-        """Validate cluster and produce a detection dict — mirrors S2TD._postprocess_cluster."""
+        """Validate cluster evidence and produce a candidate detection."""
         # Add neighbouring blues from the 3×3 window
         ys_ba, xs_ba = np.where(subset_3 == 2)
-        ys_ba = ys_ba + half_idx_y - 1
-        xs_ba = xs_ba + half_idx_x - 1
+        ys_ba = ys_ba + half_idx_y - min(y_blue, 1)
+        xs_ba = xs_ba + half_idx_x - min(x_blue, 1)
         for yb, xb in zip(ys_ba, xs_ba):
             yb_c = int(np.clip(yb, 0, cluster.shape[0] - 1))
             xb_c = int(np.clip(xb, 0, cluster.shape[1] - 1))
@@ -574,8 +548,13 @@ class ObjectExtractor:
 
         box_preds = preds_copy[ymin:ymax, xmin:xmax].copy()
         box_probs = probs[1:, ymin:ymax, xmin:xmax].copy()  # classes 2,3,4 → indices 0,1,2
+        # Only pixels reached by this cluster may validate or score it. A nearby
+        # unrelated red/green pixel inside its rectangular box is not evidence.
+        support = np.zeros_like(box_preds, dtype=bool)
+        support[cys_full - ymin, cxs_full - xmin] = True
+        box_preds[~support] = 0
 
-        # Spectral probability scores (exact S2TD logic)
+        # Spectral evidence from the extracted cluster only
         max_probs = []
         for cls_offset, cls_val in enumerate([2, 3, 4]):
             mask = (box_preds == cls_val)
@@ -584,7 +563,11 @@ class ObjectExtractor:
             max_probs.append(mp)
 
         mean_max_spectral_probability = float(np.nanmean(max_probs))
-        mean_spectral_probability = float(np.nanmean(np.nanmax(box_probs, axis=0)))
+        mean_spectral_probability = float(np.mean([
+            box_probs[int(label) - 2, y, x]
+            for y, x in zip(*np.where(support))
+            if (label := box_preds[y, x]) in (2, 3, 4)
+        ]))
 
         # Validation checks
         all_given = all(v in box_preds for v in [2, 3, 4])
@@ -596,7 +579,7 @@ class ObjectExtractor:
 
         # Score: TWO terms — matches reference
         score = mean_max_spectral_probability + mean_spectral_probability
-        if score <= 1.2:
+        if score <= self.profile["score_min"] or min(max_probs) < self.profile["class_min"]:
             return None
 
         # Direction (blue → red vector)
@@ -612,8 +595,13 @@ class ObjectExtractor:
         speed_kmh = float(np.sqrt(diameter * 20) / SECONDS_OFFSET_B02_B04 * 3.6)
 
         # Geo-coordinates (centre of detection box)
-        lat_centre = float((self.lat[ymin] + self.lat[min(ymax, len(self.lat) - 1)]) / 2)
-        lon_centre = float((self.lon[xmin] + self.lon[min(xmax, len(self.lon) - 1)]) / 2)
+        row, col = (ymin + ymax - 1) / 2, (xmin + xmax - 1) / 2
+        if self.transform is not None:
+            east, north = rio_transform.xy(self.transform, row, col)
+            lon_centre, lat_centre = self.to_wgs84.transform(east, north)
+        else:
+            lat_centre = float((self.lat[ymin] + self.lat[ymax - 1]) / 2)
+            lon_centre = float((self.lon[xmin] + self.lon[xmax - 1]) / 2)
 
         # Zero out detected pixels to prevent re-detection
         preds_copy[ymin:ymax, xmin:xmax] *= np.zeros_like(box_preds)
@@ -624,7 +612,7 @@ class ObjectExtractor:
             x0, x1 = max(0, xmin + xb - 1), min(W, xmin + xb + 2)
             preds_copy[y0:y1, x0:x1] *= (preds_copy[y0:y1, x0:x1] != 2).astype(np.int8)
 
-        crop_id = f"truck_{int(time.time() * 1000)}_{ymin}_{xmin}.png"
+        crop_id = f"truck_{uuid.uuid4().hex}.png"
 
         return {
             "updated_preds": preds_copy,
@@ -632,6 +620,7 @@ class ObjectExtractor:
                 "lat": lat_centre,
                 "lon": lon_centre,
                 "confidence": float(min(score / 2.4, 1.0)),
+                "score_calibrated": False,
                 "s_score": round(score, 3),
                 "speed_kmh": round(speed_kmh, 1),
                 "heading": round(heading, 1),
@@ -639,15 +628,16 @@ class ObjectExtractor:
                 "id": crop_id,
                 "image_url": f"/detections/{crop_id}",
                 "box_shape": list(box_preds.shape),
+                "pixel_row": row,
+                "pixel_col": col,
                 "max_probs": {"blue": max_probs[0], "green": max_probs[1], "red": max_probs[2]},
             },
         }
 
     @staticmethod
     def _direction_to_compass(deg):
-        bins = np.arange(0, 359, 45, dtype=np.float32)
         labels = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-        return labels[int(np.argmin(np.abs(bins - deg)))]
+        return labels[int((deg + 22.5) // 45) % 8]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -660,75 +650,95 @@ class ARGUSEngine:
         self.rf_model = load_rf_model()
 
     def fetch_roads(self, bbox_coords, progress_cb=None):
-        """Fetch major roads with automatic mirror rotation and fallbacks."""
-        def log(msg, level="info", pct=None):
-            if level == "info":
-                logger.info(msg)
-            elif level == "warn":
-                logger.warning(msg)
-            if progress_cb:
-                progress_cb(msg, pct)
+        """Fetch only the supported road ways, with bounded requests and caching.
 
-        min_lat, min_lon, max_lat, max_lon = bbox_coords
-        center_lat = (min_lat + max_lat) / 2
-        center_lon = (min_lon + max_lon) / 2
-
-        lat_span = (max_lat - min_lat) * 111000
-        lon_span = (max_lon - min_lon) * 111000 * np.cos(np.radians(center_lat))
-        dist_m = int(max(lat_span, lon_span) * 0.6) + 1000
-
-        log(f"Starting road discovery (ROI: {center_lat:.4f}, {center_lon:.4f})", pct=5)
-
-        for i, mirror in enumerate(OVERPASS_MIRRORS):
-            log(f"Trying mirror {i+1}/{len(OVERPASS_MIRRORS)}: {mirror}", pct=10 + i * 5)
-            ox.settings.overpass_url = mirror
+        Avoid the full driving-graph downloader: its automatic Overpass retries
+        can wait indefinitely, even though detection only needs line geometry.
+        """
+        cache_dir = os.path.join(DATA_DIR, "road_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_key = hashlib.sha256(json.dumps(bbox_coords).encode()).hexdigest()[:24]
+        cache_path = os.path.join(cache_dir, cache_key + ".geojson")
+        if os.path.isfile(cache_path):
             try:
-                graph = ox.graph_from_point(
-                    (center_lat, center_lon), dist=dist_m,
-                    network_type="drive", simplify=True,
-                    retain_all=False, truncate_by_edge=True,
-                )
-                roads = ox.graph_to_gdfs(graph, nodes=False)
-                major_types = [
-                    "motorway", "trunk", "primary", "secondary",
-                    "motorway_link", "trunk_link", "primary_link",
-                ]
-                roads = roads[roads["highway"].isin(major_types)].copy()
-                if not roads.empty:
-                    logger.info(f"Fetched {len(roads)} major roads from {mirror}")
-                    return roads
-            except Exception as e:
-                logger.warning(f"Mirror {mirror} failed: {e}")
-                time.sleep(1)
-
-        # Raw Overpass fallback
-        logger.warning("All mirrors failed. Trying raw Overpass query.")
-        try:
-            query = f"""
-            [out:json][timeout:60];
-            (way["highway"~"motorway|trunk|primary"]({min_lat},{min_lon},{max_lat},{max_lon}););
-            out body; >; out skel qt;
-            """
-            resp = requests.post(OVERPASS_MIRRORS[0], data={"data": query}, timeout=60)
-            if resp.status_code == 200:
-                data = resp.json()
-                nodes = {n["id"]: (n["lon"], n["lat"]) for n in data["elements"] if n["type"] == "node"}
+                with open(cache_path) as saved:
+                    return gpd.GeoDataFrame.from_features(json.load(saved)["features"], crs="EPSG:4326")
+            except (ValueError, KeyError):
+                logger.warning("Ignoring unreadable road cache")
+        south, west, north, east = bbox_coords
+        query = f'[out:json][timeout:15];way["highway"~"^(motorway|trunk|primary)$"]({south},{west},{north},{east});out geom;'
+        for mirror in OVERPASS_MIRRORS:
+            logger.info("Fetching road ways from %s", mirror)
+            if progress_cb:
+                progress_cb("Fetching major-road geometry...", 10)
+            try:
+                # Requests directly, rather than the retrying session, bounds
+                # each mirror attempt even when it responds with 429 or 504.
+                response = requests.post(mirror, data={"data": query}, timeout=(5, 20))
+                response.raise_for_status()
+                payload = response.json()
+                if payload.get("remark"):
+                    raise ValueError("Overpass returned incomplete results")
                 ways = []
-                for w in data["elements"]:
-                    if w["type"] == "way" and "nodes" in w:
-                        coords = [nodes[nid] for nid in w["nodes"] if nid in nodes]
-                        if len(coords) > 1:
-                            ways.append({"geometry": LineString(coords), "highway": w["tags"].get("highway")})
-                if ways:
-                    roads = gpd.GeoDataFrame(ways, crs="EPSG:4326")
-                    logger.info(f"Raw fallback: {len(roads)} roads")
-                    return roads
-        except Exception as e:
-            logger.error(f"Raw fallback failed: {e}")
+                for element in payload.get("elements", []):
+                    highway = element.get("tags", {}).get("highway")
+                    if element.get("type") != "way" or not road_buffer_m(highway):
+                        continue
+                    coords = [(point["lon"], point["lat"]) for point in element.get("geometry", [])]
+                    if len(coords) >= 2:
+                        ways.append({"geometry": LineString(coords), "highway": highway, "osmid": element["id"]})
+                if not ways:
+                    return gpd.GeoDataFrame()
+                roads = gpd.GeoDataFrame(ways, crs="EPSG:4326")
+                temp_path = cache_path + "." + uuid.uuid4().hex + ".tmp"
+                try:
+                    with open(temp_path, "w") as saved:
+                        saved.write(roads.to_json())
+                    os.replace(temp_path, cache_path)
+                except OSError:
+                    logger.warning("Roads fetched, but could not save their cache")
+                logger.info("Fetched %s major-road ways", len(roads))
+                return roads
+            except (requests.RequestException, ValueError, KeyError) as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                logger.warning("Road mirror failed (%s, HTTP %s)", type(exc).__name__, status)
+        # A small, cached map extract can keep a local test working when the
+        # Overpass services are unavailable. Never use the editing API for
+        # large areas or bulk downloads.
+        if (north - south) * (east - west) <= 0.0025:
+            logger.info("Trying a small OpenStreetMap map extract")
+            try:
+                response = requests.get(
+                    "https://api.openstreetmap.org/api/0.6/map",
+                    params={"bbox": f"{west},{south},{east},{north}"},
+                    headers={"User-Agent": "DrishX/1.0 (local road-traffic analysis)"},
+                    timeout=(5, 20),
+                )
+                response.raise_for_status()
+                root = ElementTree.fromstring(response.content)
+                nodes = {n.attrib["id"]: (float(n.attrib["lon"]), float(n.attrib["lat"])) for n in root.findall("node")}
+                ways = []
+                for way in root.findall("way"):
+                    tags = {t.attrib["k"]: t.attrib["v"] for t in way.findall("tag")}
+                    refs = [nd.attrib["ref"] for nd in way.findall("nd")]
+                    if road_buffer_m(tags.get("highway")) and len(refs) >= 2 and all(ref in nodes for ref in refs):
+                        ways.append({"geometry": LineString([nodes[ref] for ref in refs]), "highway": tags["highway"], "osmid": int(way.attrib["id"])})
+                if not ways:
+                    return gpd.GeoDataFrame()
+                roads = gpd.GeoDataFrame(ways, crs="EPSG:4326")
+                try:
+                    temp_path = cache_path + "." + uuid.uuid4().hex + ".tmp"
+                    with open(temp_path, "w") as saved:
+                        saved.write(roads.to_json())
+                    os.replace(temp_path, cache_path)
+                except OSError:
+                    logger.warning("Could not cache the small road extract")
+                return roads
+            except (requests.RequestException, ValueError, KeyError, ElementTree.ParseError) as exc:
+                logger.warning("Small road extract failed (%s)", type(exc).__name__)
+        raise RuntimeError("Road data services are temporarily unavailable. Try a smaller area or reuse a cached area.")
 
-        return gpd.GeoDataFrame()
-
-    def detect_trucks(self, data, bbox_coords, timestamp, road_mask):
+    def detect_trucks(self, data, bbox_coords, timestamp, road_mask, *, profile="balanced", transform=None, crs=None):
         """
         Detect trucks using corrected Fisser et al. methodology.
 
@@ -742,23 +752,24 @@ class ARGUSEngine:
         H, W = data.shape[:2]
 
         # 1. Build feature stack (corrected order)
-        feat = build_feature_stack(data)
+        feat = build_feature_stack(data, road_mask)
         feature_stack = feat["feature_stack"]
 
-        # 2. Classify (real RF if loaded, proxy fallback otherwise)
-        probs, prediction = classify(feature_stack, road_mask, self.rf_model)
+        # 2. Classify with the trained RF and selected filter
+        probs, prediction = classify(feature_stack, road_mask, self.rf_model, profile)
 
         # 3. Lat/lon arrays for geo-referencing
-        lat_arr = np.linspace(max_lat, min_lat, H)  # top to bottom
-        lon_arr = np.linspace(min_lon, max_lon, W)  # left to right
+        lat_arr = max_lat - (np.arange(H) + 0.5) * (max_lat - min_lat) / H
+        lon_arr = min_lon + (np.arange(W) + 0.5) * (max_lon - min_lon) / W
 
         # 4. Object extraction (corrected)
-        extractor = ObjectExtractor(probs, lat_arr, lon_arr)
+        extractor = ObjectExtractor(probs, lat_arr, lon_arr, profile=profile, transform=transform, crs=crs)
         detections = extractor.extract(prediction)
 
         # 5. Add timestamp and save crops
         for det in detections:
             det["timestamp"] = timestamp
+            det["profile"] = profile
             try:
                 self._save_crop(data, det, H, W, min_lat, min_lon, max_lat, max_lon)
             except Exception as e:
@@ -768,8 +779,7 @@ class ARGUSEngine:
 
     def _save_crop(self, data, det, H, W, min_lat, min_lon, max_lat, max_lon):
         """Save a 20×20 RGB crop centred on the detection."""
-        cy = int((max_lat - det["lat"]) / (max_lat - min_lat + 1e-9) * H)
-        cx = int((det["lon"] - min_lon) / (max_lon - min_lon + 1e-9) * W)
+        cy, cx = int(round(det["pixel_row"])), int(round(det["pixel_col"]))
         cy, cx = int(np.clip(cy, 0, H - 1)), int(np.clip(cx, 0, W - 1))
 
         y0, y1 = max(0, cy - 10), min(H, cy + 10)
@@ -796,186 +806,180 @@ engine = ARGUSEngine()
 
 
 class AnalyzeRequest(BaseModel):
-    bbox: List[float]  # [min_lat, min_lon, max_lat, max_lon]
+    bbox: List[float] = Field(min_length=4, max_length=4)
     label: str = "New Mission"
-    months: int = 4
-    max_frames: int = 10
+    months: int = Field(default=4, ge=1, le=48)
+    max_frames: int = Field(default=5, ge=1, le=1000)
+    profile: Literal["balanced", "precision"] = "balanced"
+
+    @field_validator("bbox")
+    @classmethod
+    def valid_bbox(cls, value):
+        south, west, north, east = value
+        if not all(np.isfinite(value)) or not (-80 <= south < north <= 84 and -180 <= west < east <= 180):
+            raise ValueError("Use an ordered, finite bbox within UTM coverage (80°S–84°N)")
+        return value
+
+
+def analysis_grid(bbox_coords):
+    """A fixed 10 m projected grid shared by imagery, roads and coordinates."""
+    south, west, north, east = bbox_coords
+    crs = CRS.get_utm_from_wgs84((west + east) / 2, (south + north) / 2)
+    projected = BBox([west, south, east, north], CRS.WGS84).transform_bounds(crs)
+    left, bottom = np.floor(np.array(projected.lower_left) / 10) * 10
+    right, top = np.ceil(np.array(projected.upper_right) / 10) * 10
+    width, height = int(round((right - left) / 10)), int(round((top - bottom) / 10))
+    if max(width, height) > 2500:
+        raise ValueError("AOI exceeds the 10 m imagery request limit. Select an area smaller than about 25 km per side.")
+    return BBox([left, bottom, right, top], crs), (width, height), rio_transform.from_origin(left, top, 10, 10)
 
 
 @app.post("/api/analyze")
 async def analyze(req: AnalyzeRequest):
-    async def event_generator():
+    def event_generator():
+        started = time.perf_counter()
         try:
             def progress(msg, pct):
                 return json.dumps({"type": "progress", "message": msg, "percent": pct}) + "\n"
 
-            yield progress(f"Starting analysis for: {req.label}", 0)
-
-            min_lat, min_lon, max_lat, max_lon = req.bbox
-            if abs(max_lat - min_lat) > 0.5 or abs(max_lon - min_lon) > 0.5:
-                yield json.dumps({"type": "error", "message": "AOI too large. Max strategic sector is ~55 km x 55 km."}) + "\n"
-                return
-
-            # 1. Roads
-            yield progress("Running Road Discovery Pipeline...", 10)
-            roads = engine.fetch_roads(req.bbox, progress_cb=lambda m, p: None)
+            if engine.rf_model is None:
+                raise ValueError("Trained RF model unavailable. Install rf_model.pickle with Git LFS and scikit-learn 1.3.2; restart the server.")
+            sh_bbox, (width, height), transform = analysis_grid(req.bbox)
+            yield progress(f"Starting {req.profile} analysis for: {req.label}", 0)
+            yield progress("Discovering motorway, trunk and primary roads...", 10)
+            roads = engine.fetch_roads(req.bbox)
             if roads.empty:
-                yield json.dumps({"type": "error", "message": "No major roads found in AOI."}) + "\n"
-                return
-            yield progress(f"Found {len(roads)} road corridor segments.", 25)
+                raise ValueError("No major roads found in AOI.")
 
-            # 2. Satellite imagery
-            sh_bbox = BBox(bbox=[min_lon, min_lat, max_lon, max_lat], crs=CRS.WGS84)
-            yield progress("Searching Copernicus catalog...", 30)
+            south, west, north, east = req.bbox
+            projected = roads.to_crs(sh_bbox.crs.pyproj_crs())
+            buffers = projected.geometry.buffer(projected["highway"].map(road_buffer_m))
+            aoi = gpd.GeoSeries([box(west, south, east, north)], crs="EPSG:4326").to_crs(projected.crs).iloc[0]
+            buffers = buffers.intersection(aoi)
+            shapes = [(g, 1) for g in buffers if not g.is_empty]
+            if not shapes:
+                raise ValueError("No major roads intersect the AOI.")
+            road_mask = rio_features.rasterize(shapes, out_shape=(height, width), transform=transform, fill=0, all_touched=False)
+            if not road_mask.any():
+                raise ValueError("No road pixels at 10 m resolution. Select a larger road corridor.")
+            yield progress(f"Found {len(roads)} road segments on a 10 m grid.", 25)
 
             catalog = SentinelHubCatalog(config=CONFIG)
             end_date = datetime.now()
-            start_date = end_date - timedelta(days=max(1, req.months) * 30)
-
-            cdse_collection = DataCollection.SENTINEL2_L2A.define_from(
-                "s2l2a", service_url=CONFIG.sh_base_url,
-            )
-
-            # Use CQL2 filter to avoid cloudy scenes and get unique time slots
-            search_results = list(catalog.search(
-                cdse_collection, bbox=sh_bbox,
-                datetime=f"{start_date.strftime('%Y-%m-%dT00:00:00Z')}/{end_date.strftime('%Y-%m-%dT23:59:59Z')}",
-                filter="eo:cloud_cover < 60",
-                fields={"include": ["properties.datetime", "id"], "exclude": []}
-            ))
-
-            # Group by unique date (YYYY-MM-DD) to ensure trend diversity
-            unique_scenes = {}
-            for res in search_results:
-                date_key = res["properties"]["datetime"][:10]
-                if date_key not in unique_scenes:
-                    unique_scenes[date_key] = res
-
-            # Convert back to sorted list (latest first) and respect max_frames
-            final_obs = [unique_scenes[d] for d in sorted(unique_scenes.keys(), reverse=True)]
-            final_obs = final_obs[:req.max_frames]
-
+            start_date = end_date - timedelta(days=req.months * 30)
+            cdse_collection = DataCollection.SENTINEL2_L2A.define_from("s2l2a", service_url=CONFIG.sh_base_url)
+            yield progress("Searching Copernicus catalog...", 30)
+            date_range = f"{start_date.strftime('%Y-%m-%dT00:00:00Z')}/{end_date.strftime('%Y-%m-%dT23:59:59Z')}"
+            catalog_key = hashlib.sha256(json.dumps([req.bbox, date_range]).encode()).hexdigest()
+            catalog_dir = os.path.join(DATA_DIR, "catalog_cache")
+            os.makedirs(catalog_dir, exist_ok=True)
+            catalog_path = os.path.join(catalog_dir, catalog_key + ".json")
+            results = None
+            if os.path.isfile(catalog_path) and time.time() - os.path.getmtime(catalog_path) < 900:
+                try:
+                    with open(catalog_path) as saved:
+                        results = json.load(saved)
+                except (OSError, ValueError):
+                    pass
+            if results is None:
+                results = list(catalog.search(
+                    cdse_collection, bbox=sh_bbox, time=(start_date.date().isoformat(), end_date.date().isoformat()),
+                    filter="eo:cloud_cover < 60",
+                    fields={"include": ["properties.datetime", "id"], "exclude": []},
+                ))
+                temp_catalog = catalog_path + "." + uuid.uuid4().hex + ".tmp"
+                try:
+                    with open(temp_catalog, "w") as saved:
+                        json.dump(results, saved)
+                    os.replace(temp_catalog, catalog_path)
+                except OSError:
+                    logger.warning("Could not cache the catalog search")
+            final_obs = select_observations(results, req.max_frames)
             if not final_obs:
-                yield json.dumps({"type": "error", "message": f"No clear imagery found in the last {req.months} months."}) + "\n"
-                return
+                raise ValueError(f"No candidate imagery found in the last {req.months} months.")
+            yield progress(f"Sampling {len(final_obs)} dates across the requested period.", 40)
 
-            yield progress(f"Found {len(final_obs)} unique clear overpasses. Starting analysis...", 40)
-
-            # Evalscript: output order = B04(R), B03(G), B02(B), B08(NIR), CLM
             evalscript = """//VERSION=3
 function setup() {
   return {
-    input: ["B02", "B03", "B04", "B08", "CLM"],
-    output: { id: "default", bands: 5, sampleType: "FLOAT32" }
+    input: ["B02", "B03", "B04", "B08", "CLM", "SCL", "dataMask"],
+    output: { id: "default", bands: 7, sampleType: "FLOAT32" }
   };
 }
 function evaluatePixel(s) {
-  return [s.B04, s.B03, s.B02, s.B08, s.CLM];
+  return [s.B04, s.B03, s.B02, s.B08, s.CLM, s.SCL, s.dataMask];
 }"""
 
-            # --- Optimization: Pre-calculate Road Mask ---
-            # To get dimensions, we could do one small request or calculate.
-            # Here we'll do the first frame sequentially to establish the grid,
-            # then parallelize the rest.
-            
-            detections = []
-            max_frames = min(len(final_obs), max(1, req.max_frames))
-            
-            if max_frames == 0:
-                yield json.dumps({"type": "result", "mission_id": "none", "message": "No frames."}) + "\n"
-                return
+            def fetch_frame(obs):
+                timestamp = obs["properties"]["datetime"]
+                request = SentinelHubRequest(
+                    evalscript=evalscript,
+                    input_data=[SentinelHubRequest.input_data(
+                        data_collection=cdse_collection, time_interval=(timestamp, timestamp),
+                        other_args={"processing": {"upsampling": "NEAREST", "downsampling": "NEAREST"}},
+                    )],
+                    responses=[SentinelHubRequest.output_response("default", MimeType.TIFF)],
+                    bbox=sh_bbox, size=(width, height), config=CONFIG,
+                    data_folder=os.path.join(DATA_DIR, "imagery_cache"),
+                )
+                frames = request.get_data(save_data=True)
+                if not frames or frames[0].shape != (height, width, 7):
+                    raise ValueError("Missing imagery or an unexpected image grid")
+                return frames[0]
 
-            # Helper for processing a single frame
-            def _worker(idx, res_obs):
-                try:
-                    date_str = res_obs["properties"]["datetime"]
-                    
-                    req_sh = SentinelHubRequest(
-                        evalscript=evalscript,
-                        input_data=[SentinelHubRequest.input_data(
-                            data_collection=cdse_collection,
-                            time_interval=(date_str, date_str),
-                        )],
-                        responses=[SentinelHubRequest.output_response("default", MimeType.TIFF)],
-                        bbox=sh_bbox, config=CONFIG,
-                    )
-                    
-                    data_list = req_sh.get_data()
-                    if not data_list:
-                        return idx, date_str, []
-                    
-                    frame_sat_data = data_list[0]
-                    # Note: road_mask is provided via closure or passed.
-                    # We'll calculate it once inside the loop if not yet done.
-                    return idx, date_str, frame_sat_data
-                except Exception as ex:
-                    logger.error(f"Worker error on frame {idx}: {ex}")
-                    return idx, None, None
+            detections, observations = [], []
+            # Keep at most five images in flight, even for long archives.
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                iterator = iter(final_obs)
+                pending = {executor.submit(fetch_frame, obs): obs for obs in [next(iterator) for _ in range(min(5, len(final_obs)))]}
+                while pending:
+                    future = next(as_completed(pending))
+                    obs = pending.pop(future)
+                    timestamp = obs["properties"]["datetime"]
+                    try:
+                        data = future.result()
+                        quality = observation_quality(data, road_mask, timestamp)
+                        quality["scene_id"] = obs["id"]
+                        quality["profile"] = req.profile
+                        if quality["status"] == "usable":
+                            found = engine.detect_trucks(data, req.bbox, timestamp, road_mask,
+                                                         profile=req.profile, transform=transform,
+                                                         crs=sh_bbox.crs.pyproj_crs())
+                            quality["detection_count"] = len(found)
+                            detections.extend(found)
+                        observations.append(quality)
+                        del data
+                    except Exception as exc:
+                        logger.warning("Frame %s failed: %s", timestamp, exc)
+                        observations.append({"timestamp": timestamp, "scene_id": obs["id"],
+                                             "profile": req.profile, "status": "failed",
+                                             "detection_count": None, "clear_road_fraction": None})
+                    next_obs = next(iterator, None)
+                    if next_obs is not None:
+                        pending[executor.submit(fetch_frame, next_obs)] = next_obs
+                    yield progress(f"Processed {len(observations)}/{len(final_obs)} observations", 40 + int(55 * len(observations) / len(final_obs)))
 
-            # 1. Process Frame 0 to get the road_mask (Sequential/Seed)
-            yield progress(f"Analyzing Seed Frame (1/{max_frames}) — {final_obs[0]['properties']['datetime'][:10]}", 40)
-            _, _, seed_data = _worker(0, final_obs[0])
-            
-            if seed_data is None:
-                yield json.dumps({"type": "error", "message": "Failed to acquire seed spectral data."}) + "\n"
-                return
-            
-            # Generate Road Mask once
-            from rasterio import features as rio_features, transform as rio_transform
-            roads_buf = roads.to_crs(epsg=3857).buffer(20).to_crs(epsg=4326)
-            h, w = seed_data.shape[:2]
-            trans = rio_transform.from_bounds(min_lon, min_lat, max_lon, max_lat, w, h)
-            road_mask = rio_features.rasterize(
-                [(geom.__geo_interface__, 1) for geom in roads_buf.geometry],
-                out_shape=(h, w), transform=trans, fill=0, all_touched=True,
-            )
-            
-            # Detect on seed
-            seed_dets = engine.detect_trucks(seed_data, req.bbox, final_obs[0]['properties']['datetime'], road_mask)
-            detections.extend(seed_dets)
-
-            # 2. Parallelize remaining frames
-            if max_frames > 1:
-                yield progress(f"Dispatching Parallel Telemetry Stack ({max_frames-1} frames)...", 45)
-                
-                completed_count = 1
-                with ThreadPoolExecutor(max_workers=5) as executor:
-                    futures = {executor.submit(_worker, i, final_obs[i]): i for i in range(1, max_frames)}
-                    
-                    for future in as_completed(futures):
-                        idx, d_str, f_data = future.result()
-                        completed_count += 1
-                        
-                        if f_data is not None:
-                            # Detect
-                            f_dets = engine.detect_trucks(f_data, req.bbox, d_str, road_mask)
-                            detections.extend(f_dets)
-                        
-                        pct = 45 + int((completed_count / max_frames) * 50)
-                        yield progress(f"Analyzing Orbital Stack [{completed_count}/{max_frames}]", pct)
-
-            # Finalise
-            mission_id = str(int(time.time()))
+            observations.sort(key=lambda o: o["timestamp"])
+            detections.sort(key=lambda d: (d["timestamp"], d["id"]))
+            mission_id = uuid.uuid4().hex
+            usable = sum(o["status"] == "usable" for o in observations)
+            elapsed = round(time.perf_counter() - started, 1)
             engine.history.append({
-                "mission_id": mission_id,
-                "label": req.label,
-                "bbox": req.bbox,
-                "road_count": len(roads),
-                "detections": detections,
+                "mission_id": mission_id, "label": req.label, "bbox": req.bbox,
+                "road_count": len(roads), "detections": detections,
+                "observations": observations, "profile": req.profile,
                 "timestamp": datetime.now().isoformat(),
             })
-
             yield json.dumps({
-                "type": "result",
-                "mission_id": mission_id,
-                "road_count": len(roads),
-                "detection_count": len(detections),
-                "message": f"Complete: {len(detections)} truck signatures detected.",
+                "type": "result", "mission_id": mission_id, "road_count": len(roads),
+                "detection_count": len(detections), "usable_observations": usable,
+                "excluded_observations": len(observations) - usable,
+                "elapsed_seconds": elapsed,
+                "message": f"{len(detections)} candidate signatures across {usable}/{len(observations)} usable observations in {elapsed}s. Excluded dates are gaps, not zero traffic.",
             }) + "\n"
-
-        except Exception as e:
-            logger.error(f"Stream error: {e}", exc_info=True)
-            yield json.dumps({"type": "error", "message": str(e)}) + "\n"
+        except Exception as exc:
+            logger.error("Stream error: %s", exc, exc_info=True)
+            yield json.dumps({"type": "error", "message": str(exc)}) + "\n"
 
     return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 
@@ -1033,60 +1037,7 @@ async def get_feed():
 
 @app.get("/api/analytics/trends")
 async def get_trends(from_date: str = None, to_date: str = None, site_ids: str = None):
-    """Aggregate detections across history by day, grouped by mission for comparison."""
-    # site_ids can be a comma-separated list of mission IDs
-    requested_ids = site_ids.split(",") if site_ids else []
-    
-    # 1. Collect all unique dates in the range to build a consistent X-axis
-    all_dates = set()
-    missions_data = []
-
-    for mission in engine.history:
-        m_id = mission["mission_id"]
-        if requested_ids and m_id not in requested_ids:
-            continue
-            
-        m_counts = {}
-        for det in mission["detections"]:
-            date_key = det["timestamp"][:10]
-            if from_date and date_key < from_date: continue
-            if to_date and date_key > to_date: continue
-            
-            all_dates.add(date_key)
-            m_counts[date_key] = m_counts.get(date_key, 0) + 1
-            
-        missions_data.append({
-            "id": m_id,
-            "label": mission["label"],
-            "counts": m_counts
-        })
-
-    sorted_dates = sorted(list(all_dates))
-    
-    # 2. Build aligned datasets for Chart.js
-    datasets = []
-    # Predefined colors for comparison
-    colors = ["#3b82f6", "#f59e0b", "#10b981", "#ef4444", "#a855f7", "#ec4899"]
-    
-    for i, m in enumerate(missions_data):
-        aligned_data = [m["counts"].get(d, 0) for d in sorted_dates]
-        datasets.append({
-            "label": m["label"],
-            "data": aligned_data,
-            "borderColor": colors[i % len(colors)],
-            "backgroundColor": f"{colors[i % len(colors)]}22" # 13% opacity
-        })
-
-    total_detections = sum(sum(d["data"]) for d in datasets)
-
-    return {
-        "labels": sorted_dates,
-        "datasets": datasets,
-        "summary": {
-            "total_detections": total_detections,
-            "missions_count": len(datasets)
-        }
-    }
+    return build_trends(engine.history, from_date, to_date, site_ids)
 
 
 @app.get("/api/detections/{mission_id}")
@@ -1095,6 +1046,22 @@ async def get_detections(mission_id: str):
     if not mission:
         raise HTTPException(status_code=404, detail="Mission not found")
     return mission["detections"]
+
+
+@app.get("/api/missions/{mission_id}/export")
+async def export_mission(mission_id: str, kind: Literal["observations", "detections"] = "observations"):
+    mission = next((m for m in engine.history if m["mission_id"] == mission_id), None)
+    if mission is None:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    fields = (["timestamp", "scene_id", "profile", "status", "detection_count", "clear_road_fraction", "clear_road_pixels", "road_pixels"]
+              if kind == "observations" else
+              ["id", "timestamp", "lat", "lon", "profile", "s_score", "score_calibrated", "speed_kmh", "heading", "image_url"])
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(mission[kind])
+    return Response(output.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="drishx-{mission_id}-{kind}.csv"'})
 
 
 class AuthRequest(BaseModel):
@@ -1157,6 +1124,7 @@ async def authenticate(req: AuthRequest):
 
     AUTH_STATE["source"] = "ui"
     AUTH_STATE["last_verified"] = datetime.utcnow().isoformat() + "Z"
+    AUTH_STATE["verification_error"] = None
     logger.info("Copernicus credentials updated and verified via UI.")
     return {"status": "success", "code": "linked", "message": "Copernicus link established."}
 
@@ -1169,6 +1137,7 @@ async def auth_status():
         "linked": linked,
         "source": AUTH_STATE["source"] if linked else None,
         "last_verified": AUTH_STATE["last_verified"] if linked else None,
+        "verification_error": AUTH_STATE["verification_error"] if linked else None,
     }
 
 
@@ -1183,6 +1152,7 @@ async def disconnect():
         logger.warning(f"Could not clear persisted credentials: {e}")
     AUTH_STATE["source"] = None
     AUTH_STATE["last_verified"] = None
+    AUTH_STATE["verification_error"] = None
     message = "Copernicus credentials removed."
     if os.getenv("COPERNICUS_CLIENT_ID") and os.getenv("COPERNICUS_CLIENT_SECRET"):
         message += " Environment credentials will re-link on the next server restart."
@@ -1193,7 +1163,7 @@ async def disconnect():
 app.mount("/detections", StaticFiles(directory=DETECTION_DIR), name="detections")
 
 # Serve frontend
-app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "frontend"), html=True), name="frontend")
 
 
 if __name__ == "__main__":
@@ -1202,7 +1172,9 @@ if __name__ == "__main__":
         AUTH_STATE["last_verified"] = datetime.utcnow().isoformat() + "Z"
         logger.info("Copernicus Data Space Authentication: SUCCESS")
     except Exception as e:
-        logger.error(f"Copernicus Data Space Authentication: FAILED - {e}")
+        code, message = _classify_auth_error(e)
+        AUTH_STATE["verification_error"] = {"code": code, "message": message}
+        logger.error("Copernicus Data Space Authentication: FAILED (%s)", code)
         logger.warning("System will start, but satellite monitoring may be degraded.")
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=os.getenv("DRISHX_HOST", "127.0.0.1"), port=8000)
