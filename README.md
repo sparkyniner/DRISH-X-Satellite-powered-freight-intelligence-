@@ -181,7 +181,7 @@ Sentinel-2 Image (10m resolution, 5-day revisit)
     |
     +-- 2. Random Forest Classification
     |     Each pixel classified as: background, blue, green, or red
-    |     Post-process: threshold background confidence at 0.75
+    |     Post-process: require blue-seed probability >= 0.75 (Balanced)
     |
     +-- 3. Recursive Object Extraction
     |     Start at blue pixels, grow through green, then red
@@ -287,7 +287,7 @@ drishx/
 
 ### Cloud Cover
 
-DrishX uses the Sentinel-2 cloud mask to exclude cloudy pixels. Overcast frames show zero detections. That is correct behavior. Focus on the moving average trend rather than individual days.
+DrishX uses cloud, scene-classification and no-data masks. Observations with insufficient clear road coverage are gaps, not zero-traffic days. Inspect the observation-quality table alongside counts.
 
 ### Regional Accuracy
 
@@ -302,9 +302,9 @@ Trained on German autobahns. In practice:
 
 ## References
 
-Fisser, H., Rahimi, E., Tetteh, M., Hoeser, T., Mayer-Gurr, T., and Kunzer, C. [Detecting Moving Trucks on Roads Using Sentinel-2 Data](https://ui.adsabs.harvard.edu/abs/2022RemS...14.1595F/abstract). Remote Sensing of Environment, 2022.
+Fisser, H., Khorsandi, E., Wegmann, M., and Baier, F. [Detecting Moving Trucks on Roads Using Sentinel-2 Data](https://ui.adsabs.harvard.edu/abs/2022RemS...14.1595F/abstract). Remote Sensing 14(7), 1595, 2022.
 
-Reference implementation: [S2TruckDetect](https://ui.adsabs.harvard.edu/abs/2022RemS...14.1595F/abstract) by Henrik Fisser.
+Reference implementation: [S2TD](https://github.com/hfisser/S2TD) by Henrik Fisser.
 
 Satellite data: [Copernicus Data Space Ecosystem](https://dataspace.copernicus.eu/) (free, ESA).
 Roads: [OpenStreetMap](https://www.openstreetmap.org/) via Overpass API.
@@ -326,3 +326,101 @@ MIT.
 [Sairaj Balaji](https://www.linkedin.com/in/sairaj-balaji-7295b2246/)
 
 </div>
+
+## Detection quality update
+
+The analysis now requires the trained S2TD Random Forest; a missing or incompatible
+model produces a visible error instead of substituting a heuristic. The model path
+defaults to the file beside `drishx.py`, independent of the working directory.
+If the model is a Git LFS pointer rather than the full file, run `git lfs pull`.
+
+- **Model inputs:** RGB variance uses the reference implementation's `ddof=-1`;
+  mean centering uses valid road pixels. Surrounding fields, water and buildings
+  no longer shift the road features. RF probability columns are mapped by class
+  label, and the blue-seed threshold is correctly documented as blue, not background.
+- **Roads and grid:** imagery is requested on one 10 m UTM grid with nearest-neighbor
+  resampling. Motorway, trunk and primary buffers are 20, 15 and 10 m respectively;
+  secondary roads and ramps are excluded. AOIs are limited to 2,500 pixels per side
+  (about 25 km) to respect a single imagery request's size limit.
+- **Invalid observations:** CLM, SCL and dataMask exclude cloud, cloud shadow,
+  cirrus, snow/ice, defective and missing pixels, plus a one-pixel margin.
+  Scenes below 80% usable road coverage are excluded. This is a configurable code
+  default in `detection_quality.py`, not a validated universal threshold.
+- **Object checks:** clusters must contain their own blue, green and red evidence;
+  unrelated pixels inside a rectangular bounding box cannot validate a candidate.
+  Extraction handles image edges correctly, and coordinates refer to pixel centers.
+- **Filters:** Balanced uses blue seed >= 0.75 and object score > 1.2. Experimental
+  Strict uses blue seed >= 0.85, object score > 1.5 and at least 0.60 maximum
+  probability for each of the three colors. Strict may reduce recall. The displayed
+  spectral score ranges from 0 to 2 and is **not a calibrated probability**.
+- **Trends:** the frame budget is spread across the requested time period.
+  Usable zero-detection scenes appear as zero; insufficient coverage, failed
+  acquisitions and unobserved dates appear as gaps. Counts describe moving-vehicle
+  candidates at overpass time, not daily traffic totals. Compare the same road area,
+  filter and similar coverage; do not interpret different AOI counts as traffic growth.
+- **Exports:** the Trends view shows observation quality and CSV download links.
+  `GET /api/missions/{mission_id}/export?kind=observations` includes all sampled
+  dates, scene IDs, coverage and status. Use `kind=detections` for candidate locations,
+  timestamps and spectral scores. Exports include all mission dates regardless of
+  the chart's date filter. History remains in memory; export before restarting.
+
+### Validation and next accuracy work
+
+From `DrishX/`, using Python 3.11:
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests -q
+```
+
+Tests cover feature invariance to off-road land cover, model class order, invalid
+pixel masks, image-edge extraction, strict-score rejection, time sampling, chart
+missingness and CSV/API behavior. A smoke test uses the bundled model on a uniform
+synthetic scene. These checks establish software behavior, **not field accuracy**.
+No precision/recall improvement has been measured on labeled satellite scenes yet.
+
+Before tuning thresholds or retraining, label complete road chips from several
+corridors and dates, including true vehicles, static colored roofs, road markings,
+cloud edges and empty roads. Label missed vehicles as well as detected candidates.
+Keep entire locations and dates out of the tuning split; report object-level
+precision, recall and false detections per observed road km on that held-out set.
+Compare the original build, corrected Balanced and Strict at matching coverage.
+Do not count unlabeled candidates as false positives or choose thresholds on the
+held-out test set. Use confirmed false positives as hard negatives in a subsequent
+training iteration. Repeated same-position detections should be reviewed before
+adding a temporal rejection rule: queues and recurring traffic can be real.
+
+Method references:
+[Fisser et al. (2022), Remote Sensing 14(7), 1595](https://doi.org/10.3390/rs14071595),
+[S2TD reference implementation](https://github.com/hfisser/S2TD), and
+[Sentinel Hub S2 L2A bands and quality masks](https://docs.sentinel-hub.com/api/latest/data/sentinel-2-l2a/).
+
+## Faster local testing and map tiles
+
+The street basemap now uses `https://tile.openstreetmap.org/{z}/{x}/{y}.png`
+with visible OpenStreetMap attribution. No CARTO account or map API key is
+required. Copernicus OAuth credentials are still required for Sentinel imagery.
+The public tile service is intended for normal interactive viewing, not bulk
+prefetching; see the [OSM tile policy](https://operations.osmfoundation.org/policies/tiles/).
+
+Fast Scan now defaults to five sampled dates. Balanced detection thresholds and
+10 m image resolution are unchanged; choose more dates for a denser time series.
+Image requests remain parallel (up to five at once). Road geometry is cached,
+catalog searches are reused for 15 minutes, and identical imagery requests reuse
+downloaded files in `drishx_data/imagery_cache/`. Switching the detection filter
+can reuse imagery while recomputing detections.
+
+Road discovery downloads only motorway/trunk/primary ways with bounded timeouts.
+The global Overpass providers are listed in the
+[OSM instance directory](https://wiki.openstreetmap.org/wiki/Overpass_API).
+For small areas up to 0.0025 square degrees, a cached OSM map extract is a fallback
+if those services fail. Larger areas require working Overpass service or cached
+roads. Background analysis runs outside the web server's event loop, so the map
+and connection controls remain responsive during downloads. Completed analyses
+report elapsed time.
+
+Only `.env` files in the repository root or `DrishX/` are loaded. An unrelated
+`.env` in a parent directory can no longer override the credentials saved through
+the app. A failed startup verification shows Reconnect instead of Connected.
+The local server binds to `127.0.0.1`; set `DRISHX_HOST` explicitly when hosting
+elsewhere. Credentials remain local and must not be committed to GitHub.
